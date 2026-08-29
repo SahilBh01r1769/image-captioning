@@ -17,11 +17,11 @@ jobs:
           cache-dependency-path: demo/requirements.txt
       - name: Install demo dependencies
         run: pip install -r demo/requirements.txt
-      - name: Compile demo
-        run: python -m py_compile demo/app.py inference.py attention_model.py model.py vocabulary.py config.py
+      - name: Compile hosted entrypoint
+        run: python -m py_compile streamlit_app.py demo/app.py inference.py attention_model.py model.py vocabulary.py config.py
       - name: Start Streamlit
         run: |
-          streamlit run demo/app.py --server.headless true --server.port 8501 > /tmp/streamlit.log 2>&1 &
+          streamlit run streamlit_app.py --server.headless true --server.port 8501 > /tmp/streamlit.log 2>&1 &
           APP_PID=$!
           trap 'kill $APP_PID || true' EXIT
           for attempt in $(seq 1 30); do
