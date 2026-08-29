@@ -1,34 +1,24 @@
-# inference.py
-"""
-Caption generation for Image Captioning model.
+"""Caption generation for baseline and explainable attention architectures."""
+from __future__ import annotations
 
-Supports
---------
-  Greedy decoding  — fast, picks argmax at each step
-  Beam Search      — higher quality, keeps top-k hypotheses
-"""
-
-import os
 import argparse
+from dataclasses import dataclass, field
 import glob
+import math
+import os
 from typing import Optional
 
+import numpy as np
+from PIL import Image
 import torch
 import torch.nn.functional as F
-from PIL import Image
 import torchvision.transforms as T
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 import config
+from attention_model import ExplainableCaptioningModel
 from model import ImageCaptioningModel
-from utils.vocabulary import Vocabulary
+from vocabulary import Vocabulary
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Image preprocessing
-# ══════════════════════════════════════════════════════════════════════════════
 
 _INFER_TRANSFORM = T.Compose([
     T.Resize(256),
@@ -38,241 +28,343 @@ _INFER_TRANSFORM = T.Compose([
 ])
 
 
+@dataclass
+class TokenEvidence:
+    word: str
+    confidence: float
+    attention: list[float] = field(default_factory=list)
+
+
+@dataclass
+class CaptionResult:
+    caption: str
+    score: float
+    tokens: list[TokenEvidence] = field(default_factory=list)
+
+
+def preprocess_image(image: Image.Image, device: torch.device) -> torch.Tensor:
+    return _INFER_TRANSFORM(image.convert("RGB")).unsqueeze(0).to(device)
+
+
 def load_image(path: str, device: torch.device) -> torch.Tensor:
-    """Load, preprocess and return image tensor with batch dim."""
-    img = Image.open(path).convert("RGB")
-    return _INFER_TRANSFORM(img).unsqueeze(0).to(device)
+    return preprocess_image(Image.open(path), device)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Model loading
-# ══════════════════════════════════════════════════════════════════════════════
+def _build_model_for_checkpoint(checkpoint: dict, vocab: Vocabulary, device: torch.device):
+    architecture = checkpoint.get("architecture", "baseline")
+    dropout = 0.0
+    common = dict(
+        vocab_size=len(vocab),
+        embed_dim=config.EMBED_DIM,
+        hidden_dim=config.HIDDEN_DIM,
+        dropout=dropout,
+        pad_idx=vocab[config.PAD_TOKEN],
+        fine_tune_cnn=False,
+    )
+    if architecture == "attention":
+        model = ExplainableCaptioningModel(
+            **common,
+            encoder_dim=config.ATTENTION_ENCODER_DIM,
+            attention_dim=config.ATTENTION_DIM,
+        )
+    else:
+        model = ImageCaptioningModel(**common, num_layers=config.NUM_LAYERS)
+    model.load_state_dict(checkpoint["model_state"])
+    model.to(device).eval()
+    return model, architecture
 
-def load_model(ckpt_path: str,
-               vocab: Vocabulary,
-               device: torch.device) -> ImageCaptioningModel:
-    ckpt = torch.load(ckpt_path, map_location=device)
-    model = ImageCaptioningModel(
-        vocab_size  = len(vocab),
-        embed_dim   = config.EMBED_DIM,
-        hidden_dim  = config.HIDDEN_DIM,
-        num_layers  = config.NUM_LAYERS,
-        dropout     = 0.0,          # disabled at inference
-        pad_idx     = vocab[config.PAD_TOKEN],
-        fine_tune_cnn = False,
-    ).to(device)
-    model.load_state_dict(ckpt["model_state"])
-    model.eval()
-    return model
 
+def load_model(ckpt_path: str, vocab: Vocabulary, device: torch.device):
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Model checkpoint not found: {ckpt_path}")
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    model, architecture = _build_model_for_checkpoint(checkpoint, vocab, device)
+    return model, architecture
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Greedy decoding
-# ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def greedy_decode(model: ImageCaptioningModel,
-                  img_tensor: torch.Tensor,
-                  vocab: Vocabulary,
-                  max_len: int = config.MAX_GEN_LEN) -> str:
-    """
-    Generate a caption using greedy (argmax) decoding.
-
-    At each step we pick the highest-probability next token.
-    """
-    device    = img_tensor.device
+def baseline_greedy_decode(
+    model: ImageCaptioningModel,
+    img_tensor: torch.Tensor,
+    vocab: Vocabulary,
+    max_len: int = config.MAX_GEN_LEN,
+) -> CaptionResult:
+    device = img_tensor.device
     start_idx = vocab[config.START_TOKEN]
-    end_idx   = vocab[config.END_TOKEN]
-    pad_idx   = vocab[config.PAD_TOKEN]
-
-    img_feat = model.encode(img_tensor)     # (1, embed_dim)
-    h, c     = model.decoder._init_lstm_state(img_feat)
-
-    token    = torch.tensor([[start_idx]], device=device)   # (1, 1)
-    tokens   = []
+    end_idx = vocab[config.END_TOKEN]
+    pad_idx = vocab[config.PAD_TOKEN]
+    img_feat = model.encode(img_tensor)
+    hidden, cell = model.decoder._init_lstm_state(img_feat)
+    token = torch.tensor([[start_idx]], device=device)
+    evidence: list[TokenEvidence] = []
+    score = 0.0
 
     for _ in range(max_len):
-        embed  = model.decoder.embedding(token)              # (1, 1, embed_dim)
-        out, (h, c) = model.decoder.lstm(embed, (h, c))     # (1, 1, hidden)
-        logits = model.decoder.classifier(out.squeeze(1))   # (1, vocab_size)
-        pred   = logits.argmax(dim=-1)                       # (1,)
-
-        idx = pred.item()
+        embedding = model.decoder.embedding(token)
+        output, (hidden, cell) = model.decoder.lstm(embedding, (hidden, cell))
+        logits = model.decoder.classifier(output.squeeze(1))
+        probs = F.softmax(logits, dim=-1)
+        confidence, prediction = probs.max(dim=-1)
+        idx = int(prediction.item())
         if idx == end_idx:
             break
         if idx != pad_idx:
-            tokens.append(idx)
-        token = pred.unsqueeze(1)
+            word = vocab.idx2word.get(idx, config.UNK_TOKEN)
+            prob = float(confidence.item())
+            evidence.append(TokenEvidence(word=word, confidence=prob))
+            score += math.log(max(prob, 1e-12))
+        token = prediction.unsqueeze(1)
 
-    return vocab.decode(tokens)
+    caption = " ".join(token.word for token in evidence)
+    return CaptionResult(caption=caption, score=score, tokens=evidence)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Beam Search decoding
-# ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def beam_search_decode(model: ImageCaptioningModel,
-                        img_tensor: torch.Tensor,
-                        vocab: Vocabulary,
-                        beam_size: int = config.BEAM_SIZE,
-                        max_len:   int = config.MAX_GEN_LEN) -> list[tuple[str, float]]:
-    """
-    Beam search decoding.
+def attention_greedy_decode(
+    model: ExplainableCaptioningModel,
+    img_tensor: torch.Tensor,
+    vocab: Vocabulary,
+    max_len: int = config.MAX_GEN_LEN,
+    temperature: float = config.DEFAULT_TEMPERATURE,
+) -> CaptionResult:
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
 
-    Returns
-    -------
-    List of (caption_string, score) sorted by score descending.
-    Score = log-probability (higher is better, all values ≤ 0).
-    """
-    device    = img_tensor.device
+    device = img_tensor.device
+    encoder_out = model.encode(img_tensor)
+    state = model.decoder.init_state(encoder_out)
+    token = torch.tensor([vocab[config.START_TOKEN]], device=device)
+    end_idx = vocab[config.END_TOKEN]
+    pad_idx = vocab[config.PAD_TOKEN]
+    evidence: list[TokenEvidence] = []
+    score = 0.0
+
+    for _ in range(max_len):
+        logits, state, alpha = model.decoder.step(token, encoder_out, state)
+        probs = F.softmax(logits / temperature, dim=-1)
+        confidence, prediction = probs.max(dim=-1)
+        idx = int(prediction.item())
+        if idx == end_idx:
+            break
+        if idx != pad_idx:
+            word = vocab.idx2word.get(idx, config.UNK_TOKEN)
+            prob = float(confidence.item())
+            evidence.append(
+                TokenEvidence(
+                    word=word,
+                    confidence=prob,
+                    attention=alpha.squeeze(0).detach().cpu().tolist(),
+                )
+            )
+            score += math.log(max(prob, 1e-12))
+        token = prediction
+
+    return CaptionResult(
+        caption=" ".join(item.word for item in evidence),
+        score=score,
+        tokens=evidence,
+    )
+
+
+def _length_penalized(log_prob: float, length: int, alpha: float = 0.7) -> float:
+    length = max(length, 1)
+    return log_prob / (((5.0 + length) / 6.0) ** alpha)
+
+
+@torch.no_grad()
+def baseline_beam_search_decode(
+    model: ImageCaptioningModel,
+    img_tensor: torch.Tensor,
+    vocab: Vocabulary,
+    beam_size: int = config.BEAM_SIZE,
+    max_len: int = config.MAX_GEN_LEN,
+) -> list[CaptionResult]:
+    device = img_tensor.device
     start_idx = vocab[config.START_TOKEN]
-    end_idx   = vocab[config.END_TOKEN]
-    pad_idx   = vocab[config.PAD_TOKEN]
-
-    img_feat = model.encode(img_tensor)           # (1, embed_dim)
-    h, c     = model.decoder._init_lstm_state(img_feat)
-
-    # Each beam: (log_prob, token_ids, h, c)
-    beams = [(0.0, [start_idx], h, c)]
+    end_idx = vocab[config.END_TOKEN]
+    pad_idx = vocab[config.PAD_TOKEN]
+    img_feat = model.encode(img_tensor)
+    hidden, cell = model.decoder._init_lstm_state(img_feat)
+    beams = [(0.0, [start_idx], hidden, cell, [])]
     completed = []
 
     for step in range(max_len):
-        new_beams = []
-        for log_prob, tokens, h_t, c_t in beams:
-            last_token = torch.tensor([[tokens[-1]]], device=device)
-            embed      = model.decoder.embedding(last_token)     # (1,1,E)
-            out, (h_new, c_new) = model.decoder.lstm(embed, (h_t, c_t))
-            log_probs  = F.log_softmax(
-                model.decoder.classifier(out.squeeze(1)), dim=-1
-            ).squeeze(0)   # (vocab_size,)
-
-            # Top-k candidates
-            topk_lp, topk_idx = log_probs.topk(beam_size)
-            for lp, idx in zip(topk_lp.tolist(), topk_idx.tolist()):
-                new_tokens   = tokens + [idx]
+        candidates = []
+        for log_prob, ids, h_t, c_t, evidence in beams:
+            last = torch.tensor([[ids[-1]]], device=device)
+            embedding = model.decoder.embedding(last)
+            output, (h_new, c_new) = model.decoder.lstm(embedding, (h_t, c_t))
+            log_probs = F.log_softmax(model.decoder.classifier(output.squeeze(1)), dim=-1).squeeze(0)
+            top_lp, top_idx = log_probs.topk(beam_size)
+            for lp, idx in zip(top_lp.tolist(), top_idx.tolist()):
                 new_log_prob = log_prob + lp
-
+                new_ids = ids + [idx]
+                new_evidence = evidence
+                if idx not in (end_idx, pad_idx):
+                    new_evidence = evidence + [
+                        TokenEvidence(
+                            word=vocab.idx2word.get(idx, config.UNK_TOKEN),
+                            confidence=float(math.exp(lp)),
+                        )
+                    ]
                 if idx == end_idx or step == max_len - 1:
-                    completed.append((new_log_prob, new_tokens))
+                    completed.append((new_log_prob, new_ids, new_evidence))
                 else:
-                    new_beams.append((new_log_prob, new_tokens, h_new, c_new))
-
-        # Keep top beam_size beams
-        new_beams.sort(key=lambda x: x[0], reverse=True)
-        beams = new_beams[:beam_size]
-
+                    candidates.append((new_log_prob, new_ids, h_new, c_new, new_evidence))
+        candidates.sort(key=lambda item: _length_penalized(item[0], len(item[1])), reverse=True)
+        beams = candidates[:beam_size]
         if not beams:
             break
 
     if not completed:
-        completed = [(lp, toks) for lp, toks, _, _ in beams]
-
-    completed.sort(key=lambda x: x[0], reverse=True)
-
-    results = []
-    for lp, token_ids in completed[:beam_size]:
-        # Remove START token before decoding
-        caption = vocab.decode(token_ids[1:])
-        results.append((caption, lp))
-
-    return results
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Visualisation
-# ══════════════════════════════════════════════════════════════════════════════
-
-def show_captioned_image(image_path: str,
-                          caption: str,
-                          save_path: Optional[str] = None) -> None:
-    """Display or save an image with its generated caption."""
-    img = Image.open(image_path).convert("RGB")
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.imshow(img)
-    ax.axis("off")
-    ax.set_title(caption, fontsize=13, wrap=True,
-                 fontdict={"family": "DejaVu Sans"},
-                 pad=10)
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"Saved → {save_path}")
-    else:
-        plt.show()
-    plt.close()
+        completed = [(lp, ids, evidence) for lp, ids, _, _, evidence in beams]
+    completed.sort(key=lambda item: _length_penalized(item[0], len(item[1])), reverse=True)
+    return [
+        CaptionResult(
+            caption=" ".join(token.word for token in evidence),
+            score=_length_penalized(log_prob, len(ids)),
+            tokens=evidence,
+        )
+        for log_prob, ids, evidence in completed[:beam_size]
+    ]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  CLI
-# ══════════════════════════════════════════════════════════════════════════════
+@torch.no_grad()
+def attention_beam_search_decode(
+    model: ExplainableCaptioningModel,
+    img_tensor: torch.Tensor,
+    vocab: Vocabulary,
+    beam_size: int = config.BEAM_SIZE,
+    max_len: int = config.MAX_GEN_LEN,
+    temperature: float = config.DEFAULT_TEMPERATURE,
+) -> list[CaptionResult]:
+    if beam_size < 1:
+        raise ValueError("beam_size must be at least 1")
+    device = img_tensor.device
+    encoder_out = model.encode(img_tensor)
+    initial_state = model.decoder.init_state(encoder_out)
+    start_idx = vocab[config.START_TOKEN]
+    end_idx = vocab[config.END_TOKEN]
+    pad_idx = vocab[config.PAD_TOKEN]
+    beams = [(0.0, [start_idx], initial_state, [])]
+    completed = []
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Generate captions for images")
-    p.add_argument("--image",      type=str, default=None,
-                   help="Path to a single image file")
-    p.add_argument("--image_dir",  type=str, default=None,
-                   help="Path to a folder of images")
-    p.add_argument("--model",      type=str, default=config.BEST_MODEL_PATH,
-                   help="Path to model checkpoint")
-    p.add_argument("--beam_size",  type=int, default=config.BEAM_SIZE,
-                   help="Beam size (1 = greedy)")
-    p.add_argument("--save_dir",   type=str, default=config.OUTPUTS_DIR,
-                   help="Where to save captioned images")
-    return p.parse_args()
+    for step in range(max_len):
+        candidates = []
+        for log_prob, ids, state, evidence in beams:
+            token = torch.tensor([ids[-1]], device=device)
+            logits, next_state, alpha = model.decoder.step(token, encoder_out, state)
+            log_probs = F.log_softmax(logits / temperature, dim=-1).squeeze(0)
+            top_lp, top_idx = log_probs.topk(beam_size)
+            attention = alpha.squeeze(0).detach().cpu().tolist()
+
+            for lp, idx in zip(top_lp.tolist(), top_idx.tolist()):
+                new_log_prob = log_prob + lp
+                new_ids = ids + [idx]
+                new_evidence = evidence
+                if idx not in (end_idx, pad_idx):
+                    new_evidence = evidence + [
+                        TokenEvidence(
+                            word=vocab.idx2word.get(idx, config.UNK_TOKEN),
+                            confidence=float(math.exp(lp)),
+                            attention=attention,
+                        )
+                    ]
+                if idx == end_idx or step == max_len - 1:
+                    completed.append((new_log_prob, new_ids, new_evidence))
+                else:
+                    candidates.append((new_log_prob, new_ids, next_state, new_evidence))
+
+        candidates.sort(key=lambda item: _length_penalized(item[0], len(item[1])), reverse=True)
+        beams = candidates[:beam_size]
+        if not beams:
+            break
+
+    if not completed:
+        completed = [(lp, ids, evidence) for lp, ids, _, evidence in beams]
+    completed.sort(key=lambda item: _length_penalized(item[0], len(item[1])), reverse=True)
+    return [
+        CaptionResult(
+            caption=" ".join(token.word for token in evidence),
+            score=_length_penalized(log_prob, len(ids)),
+            tokens=evidence,
+        )
+        for log_prob, ids, evidence in completed[:beam_size]
+    ]
 
 
-def caption_one(image_path: str,
-                model: ImageCaptioningModel,
-                vocab: Vocabulary,
-                beam_size: int,
-                save_dir: str) -> None:
-    img_tensor = load_image(image_path, config.DEVICE)
-
+def generate_captions(
+    model,
+    architecture: str,
+    img_tensor: torch.Tensor,
+    vocab: Vocabulary,
+    beam_size: int = config.BEAM_SIZE,
+    max_len: int = config.MAX_GEN_LEN,
+    temperature: float = config.DEFAULT_TEMPERATURE,
+) -> list[CaptionResult]:
+    if architecture == "attention":
+        if beam_size == 1:
+            return [attention_greedy_decode(model, img_tensor, vocab, max_len, temperature)]
+        return attention_beam_search_decode(model, img_tensor, vocab, beam_size, max_len, temperature)
     if beam_size == 1:
-        caption = greedy_decode(model, img_tensor, vocab)
-        print(f"\n📷 {os.path.basename(image_path)}")
-        print(f"   Caption : {caption}")
-    else:
-        results = beam_search_decode(model, img_tensor, vocab, beam_size)
-        caption = results[0][0]
-        print(f"\n📷 {os.path.basename(image_path)}")
-        print(f"   Best caption (beam={beam_size}) : {caption}")
-        for i, (cap, score) in enumerate(results[:3], 1):
-            print(f"   Beam {i} (score={score:.3f}): {cap}")
-
-    # Save visualisation
-    os.makedirs(save_dir, exist_ok=True)
-    stem     = os.path.splitext(os.path.basename(image_path))[0]
-    out_path = os.path.join(save_dir, f"{stem}_captioned.png")
-    show_captioned_image(image_path, caption, save_path=out_path)
+        return [baseline_greedy_decode(model, img_tensor, vocab, max_len)]
+    return baseline_beam_search_decode(model, img_tensor, vocab, beam_size, max_len)
 
 
-def main():
+def attention_grid(token: TokenEvidence) -> Optional[np.ndarray]:
+    """Reshape a flattened attention vector to its square spatial grid."""
+    if not token.attention:
+        return None
+    side = int(round(len(token.attention) ** 0.5))
+    if side * side != len(token.attention):
+        return None
+    return np.asarray(token.attention, dtype=np.float32).reshape(side, side)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate explainable image captions")
+    parser.add_argument("--image", type=str)
+    parser.add_argument("--image_dir", type=str)
+    parser.add_argument("--model", type=str, default=config.BEST_MODEL_PATH)
+    parser.add_argument("--beam_size", type=int, default=config.BEAM_SIZE)
+    parser.add_argument("--temperature", type=float, default=config.DEFAULT_TEMPERATURE)
+    return parser.parse_args()
+
+
+def caption_path(path: str, model, architecture: str, vocab: Vocabulary, args: argparse.Namespace) -> None:
+    image_tensor = load_image(path, config.DEVICE)
+    results = generate_captions(
+        model,
+        architecture,
+        image_tensor,
+        vocab,
+        beam_size=args.beam_size,
+        temperature=args.temperature,
+    )
+    print(f"\n{os.path.basename(path)} [{architecture}]")
+    for rank, result in enumerate(results[:3], 1):
+        print(f"  {rank}. {result.caption}  (score={result.score:.3f})")
+        if result.tokens:
+            mean_conf = sum(token.confidence for token in result.tokens) / len(result.tokens)
+            print(f"     mean token confidence={mean_conf:.1%}")
+
+
+def main() -> None:
     args = parse_args()
-
-    if not os.path.exists(args.model):
-        print(f"❌ Model not found at {args.model}. Please train first.")
-        return
-
     vocab = Vocabulary.load()
-    model = load_model(args.model, vocab, config.DEVICE)
-    print(f"Model loaded from {args.model}")
+    model, architecture = load_model(args.model, vocab, config.DEVICE)
 
     if args.image:
-        caption_one(args.image, model, vocab, args.beam_size, args.save_dir)
-    elif args.image_dir:
-        extensions = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp")
-        paths = []
-        for ext in extensions:
-            paths.extend(glob.glob(os.path.join(args.image_dir, ext)))
-        if not paths:
-            print(f"No images found in {args.image_dir}")
-            return
+        caption_path(args.image, model, architecture, vocab, args)
+        return
+    if args.image_dir:
+        paths: list[str] = []
+        for extension in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp"):
+            paths.extend(glob.glob(os.path.join(args.image_dir, extension)))
         for path in sorted(paths):
-            caption_one(path, model, vocab, args.beam_size, args.save_dir)
-    else:
-        print("Please provide --image or --image_dir")
+            caption_path(path, model, architecture, vocab, args)
+        return
+    raise SystemExit("Provide --image or --image_dir")
 
 
 if __name__ == "__main__":
