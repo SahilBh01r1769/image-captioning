@@ -64,6 +64,7 @@ def build_model(
     glove_matrix: np.ndarray | None,
     *,
     dropout: float = config.DROPOUT,
+    pretrained_encoder: bool = True,
 ):
     common = dict(
         vocab_size=len(vocab),
@@ -73,6 +74,7 @@ def build_model(
         glove_matrix=glove_matrix,
         pad_idx=vocab[config.PAD_TOKEN],
         fine_tune_cnn=False,
+        pretrained_encoder=pretrained_encoder,
     )
     if architecture == "attention":
         return ExplainableCaptioningModel(
@@ -130,12 +132,13 @@ def run_epoch(
             images = images.to(device, non_blocking=True)
             captions = captions.to(device, non_blocking=True)
             targets = captions[:, 1:].contiguous()
+            valid_steps = targets != pad_idx
 
             with torch.set_grad_enabled(is_train):
                 output = model(images, captions)
                 if architecture == "attention":
                     logits, alphas = output
-                    attn_loss = attention_coverage_loss(alphas)
+                    attn_loss = attention_coverage_loss(alphas, valid_steps)
                 else:
                     logits = output
                     attn_loss = logits.new_tensor(0.0)
@@ -150,7 +153,7 @@ def run_epoch(
                 nn.utils.clip_grad_norm_(model.parameters(), config.CLIP_GRAD_NORM)
                 optimizer.step()
 
-            non_pad = int((targets != pad_idx).sum().item())
+            non_pad = int(valid_steps.sum().item())
             total_loss += float(loss.item()) * non_pad
             total_tokens += non_pad
             total_attention += float(attn_loss.item())
