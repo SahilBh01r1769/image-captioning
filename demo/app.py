@@ -27,20 +27,37 @@ st.set_page_config(page_title="CaptionLab | Explainable Image Captioning", page_
 st.markdown(
     """
 <style>
-.block-container {max-width: 1320px; padding-top: 1.8rem; padding-bottom: 3rem;}
-.hero {padding: 1.5rem 1.7rem; border:1px solid rgba(139,92,246,.30); border-radius:20px;
-       background:linear-gradient(135deg,rgba(139,92,246,.13),rgba(20,26,43,.62)); margin-bottom:1rem;}
-.hero h1 {margin:0; font-size:2.15rem;}
-.hero p {margin:.45rem 0 0; color:#b6bfd1; max-width:850px;}
-.pill {display:inline-block; margin:.7rem .35rem 0 0; padding:.25rem .65rem; border-radius:999px;
-       border:1px solid rgba(139,92,246,.34); color:#c4b5fd; font-size:.76rem;}
-.step {padding:.85rem 1rem; border-radius:14px; background:#111827; border:1px solid rgba(148,163,184,.15); min-height:115px;}
-.step b {color:#c4b5fd; font-size:.77rem; text-transform:uppercase; letter-spacing:.08em;}
-.step p {color:#aeb9cb; margin:.35rem 0 0; font-size:.89rem;}
-.caption-card {padding:1.2rem 1.35rem; background:#131a2b; border:1px solid rgba(139,92,246,.28); border-radius:16px;}
-.caption-main {font-size:1.45rem; font-weight:650; line-height:1.4;}
-.muted {color:#94a3b8; font-size:.84rem;}
-.word-chip {display:inline-block; padding:.26rem .52rem; margin:.16rem; border-radius:8px; background:#202942; font-size:.83rem;}
+:root{--pink:#ff4fd8;--cyan:#36e6ff;--orange:#ff9d3d;--lime:#b8ff5a;--ink:#f8f7ff;--muted:#b9b5d0;--panel:#15102b;--panel2:#1d1240;--line:rgba(255,255,255,.13);}
+[data-testid="stAppViewContainer"]{background:
+radial-gradient(circle at 8% 0%,rgba(255,79,216,.18),transparent 27%),
+radial-gradient(circle at 92% 7%,rgba(54,230,255,.16),transparent 25%),
+linear-gradient(180deg,#09051a 0%,#0b0720 55%,#080417 100%);color:var(--ink);}
+[data-testid="stSidebar"]{background:linear-gradient(180deg,#12092c,#0b071d);border-right:1px solid rgba(255,79,216,.18);}
+.block-container {max-width:1320px;padding-top:1.8rem;padding-bottom:3rem;}
+h1,h2,h3{letter-spacing:-.02em;}
+.hero{position:relative;overflow:hidden;padding:1.65rem 1.8rem;border:1px solid rgba(255,255,255,.16);border-radius:24px;
+background:linear-gradient(120deg,rgba(255,79,216,.28),rgba(112,63,255,.20) 48%,rgba(54,230,255,.20));margin-bottom:1rem;box-shadow:0 20px 60px rgba(57,22,120,.22);}
+.hero:after{content:"";position:absolute;width:220px;height:220px;border-radius:50%;right:-55px;top:-85px;background:radial-gradient(circle,rgba(255,157,61,.34),rgba(255,157,61,0) 68%);}
+.hero h1{margin:0;font-size:2.25rem;background:linear-gradient(90deg,#fff,#ffb5ef 32%,#9ff4ff 68%,#ffe0aa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+.hero p{margin:.5rem 0 0;color:#d4d0e5;max-width:850px;line-height:1.55;}
+.pill{display:inline-block;margin:.75rem .36rem 0 0;padding:.28rem .68rem;border-radius:999px;font-weight:700;letter-spacing:.03em;font-size:.73rem;border:1px solid rgba(255,255,255,.18);background:rgba(9,5,26,.35);}
+.pill:nth-of-type(1){color:#ff93e7;border-color:rgba(255,79,216,.45)}
+.pill:nth-of-type(2){color:#81efff;border-color:rgba(54,230,255,.45)}
+.pill:nth-of-type(3){color:#ffd08c;border-color:rgba(255,157,61,.45)}
+.pill:nth-of-type(4){color:#d2ff93;border-color:rgba(184,255,90,.40)}
+.step{padding:.95rem 1.05rem;border-radius:16px;background:linear-gradient(145deg,rgba(29,18,64,.95),rgba(18,12,43,.92));border:1px solid var(--line);min-height:118px;box-shadow:inset 0 1px 0 rgba(255,255,255,.03);}
+.step:nth-child(1){border-top:2px solid var(--pink)}
+.step b{color:#ff8de4;font-size:.76rem;text-transform:uppercase;letter-spacing:.1em;}
+.step p{color:#c4bfd8;margin:.38rem 0 0;font-size:.89rem;line-height:1.5;}
+.caption-card{padding:1.3rem 1.45rem;background:linear-gradient(135deg,rgba(255,79,216,.12),rgba(54,230,255,.08),rgba(29,18,64,.88));border:1px solid rgba(255,79,216,.32);border-radius:18px;box-shadow:0 12px 35px rgba(43,15,90,.18);}
+.caption-main{font-size:1.55rem;font-weight:720;line-height:1.4;color:#fff;}
+.muted{color:#b9b5d0;font-size:.84rem;}
+.word-chip{display:inline-block;padding:.28rem .55rem;margin:.16rem;border-radius:9px;background:linear-gradient(135deg,rgba(255,79,216,.16),rgba(54,230,255,.12));border:1px solid rgba(255,255,255,.10);font-size:.83rem;}
+[data-testid="stMetric"]{background:linear-gradient(145deg,rgba(29,18,64,.75),rgba(17,10,39,.78));border:1px solid rgba(255,255,255,.10);padding:.75rem;border-radius:14px;}
+.stButton>button[kind="primary"]{background:linear-gradient(90deg,#ff4fd8,#8b5cf6 48%,#36e6ff);border:0;color:#fff;font-weight:800;box-shadow:0 8px 26px rgba(255,79,216,.22);}
+.stButton>button[kind="primary"]:hover{filter:brightness(1.08);transform:translateY(-1px);}
+[data-testid="stFileUploader"]{border:1px dashed rgba(54,230,255,.34);border-radius:16px;background:rgba(54,230,255,.035);padding:.25rem;}
+hr{border-color:rgba(255,255,255,.08)!important;}
 </style>
 <div class="hero">
   <h1>CaptionLab · Explainable Image Captioning</h1>
