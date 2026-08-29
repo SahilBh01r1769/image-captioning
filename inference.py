@@ -52,14 +52,16 @@ def load_image(path: str, device: torch.device) -> torch.Tensor:
 
 def _build_model_for_checkpoint(checkpoint: dict, vocab: Vocabulary, device: torch.device):
     architecture = checkpoint.get("architecture", "baseline")
-    dropout = 0.0
     common = dict(
         vocab_size=len(vocab),
         embed_dim=config.EMBED_DIM,
         hidden_dim=config.HIDDEN_DIM,
-        dropout=dropout,
+        dropout=0.0,
         pad_idx=vocab[config.PAD_TOKEN],
         fine_tune_cnn=False,
+        # The checkpoint already contains encoder weights; avoid a redundant
+        # ImageNet download during inference and offline evaluation.
+        pretrained_encoder=False,
     )
     if architecture == "attention":
         model = ExplainableCaptioningModel(
@@ -67,8 +69,10 @@ def _build_model_for_checkpoint(checkpoint: dict, vocab: Vocabulary, device: tor
             encoder_dim=config.ATTENTION_ENCODER_DIM,
             attention_dim=config.ATTENTION_DIM,
         )
-    else:
+    elif architecture == "baseline":
         model = ImageCaptioningModel(**common, num_layers=config.NUM_LAYERS)
+    else:
+        raise ValueError(f"Unsupported checkpoint architecture: {architecture}")
     model.load_state_dict(checkpoint["model_state"])
     model.to(device).eval()
     return model, architecture
@@ -78,8 +82,7 @@ def load_model(ckpt_path: str, vocab: Vocabulary, device: torch.device):
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Model checkpoint not found: {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location=device)
-    model, architecture = _build_model_for_checkpoint(checkpoint, vocab, device)
-    return model, architecture
+    return _build_model_for_checkpoint(checkpoint, vocab, device)
 
 
 @torch.no_grad()
@@ -115,8 +118,7 @@ def baseline_greedy_decode(
             score += math.log(max(prob, 1e-12))
         token = prediction.unsqueeze(1)
 
-    caption = " ".join(token.word for token in evidence)
-    return CaptionResult(caption=caption, score=score, tokens=evidence)
+    return CaptionResult(caption=" ".join(item.word for item in evidence), score=score, tokens=evidence)
 
 
 @torch.no_grad()
@@ -129,7 +131,6 @@ def attention_greedy_decode(
 ) -> CaptionResult:
     if temperature <= 0:
         raise ValueError("temperature must be positive")
-
     device = img_tensor.device
     encoder_out = model.encode(img_tensor)
     state = model.decoder.init_state(encoder_out)
@@ -147,28 +148,20 @@ def attention_greedy_decode(
         if idx == end_idx:
             break
         if idx != pad_idx:
-            word = vocab.idx2word.get(idx, config.UNK_TOKEN)
             prob = float(confidence.item())
-            evidence.append(
-                TokenEvidence(
-                    word=word,
-                    confidence=prob,
-                    attention=alpha.squeeze(0).detach().cpu().tolist(),
-                )
-            )
+            evidence.append(TokenEvidence(
+                word=vocab.idx2word.get(idx, config.UNK_TOKEN),
+                confidence=prob,
+                attention=alpha.squeeze(0).detach().cpu().tolist(),
+            ))
             score += math.log(max(prob, 1e-12))
         token = prediction
 
-    return CaptionResult(
-        caption=" ".join(item.word for item in evidence),
-        score=score,
-        tokens=evidence,
-    )
+    return CaptionResult(caption=" ".join(item.word for item in evidence), score=score, tokens=evidence)
 
 
 def _length_penalized(log_prob: float, length: int, alpha: float = 0.7) -> float:
-    length = max(length, 1)
-    return log_prob / (((5.0 + length) / 6.0) ** alpha)
+    return log_prob / (((5.0 + max(length, 1)) / 6.0) ** alpha)
 
 
 @torch.no_grad()
@@ -201,12 +194,10 @@ def baseline_beam_search_decode(
                 new_ids = ids + [idx]
                 new_evidence = evidence
                 if idx not in (end_idx, pad_idx):
-                    new_evidence = evidence + [
-                        TokenEvidence(
-                            word=vocab.idx2word.get(idx, config.UNK_TOKEN),
-                            confidence=float(math.exp(lp)),
-                        )
-                    ]
+                    new_evidence = evidence + [TokenEvidence(
+                        word=vocab.idx2word.get(idx, config.UNK_TOKEN),
+                        confidence=float(math.exp(lp)),
+                    )]
                 if idx == end_idx or step == max_len - 1:
                     completed.append((new_log_prob, new_ids, new_evidence))
                 else:
@@ -240,6 +231,9 @@ def attention_beam_search_decode(
 ) -> list[CaptionResult]:
     if beam_size < 1:
         raise ValueError("beam_size must be at least 1")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+
     device = img_tensor.device
     encoder_out = model.encode(img_tensor)
     initial_state = model.decoder.init_state(encoder_out)
@@ -257,24 +251,20 @@ def attention_beam_search_decode(
             log_probs = F.log_softmax(logits / temperature, dim=-1).squeeze(0)
             top_lp, top_idx = log_probs.topk(beam_size)
             attention = alpha.squeeze(0).detach().cpu().tolist()
-
             for lp, idx in zip(top_lp.tolist(), top_idx.tolist()):
                 new_log_prob = log_prob + lp
                 new_ids = ids + [idx]
                 new_evidence = evidence
                 if idx not in (end_idx, pad_idx):
-                    new_evidence = evidence + [
-                        TokenEvidence(
-                            word=vocab.idx2word.get(idx, config.UNK_TOKEN),
-                            confidence=float(math.exp(lp)),
-                            attention=attention,
-                        )
-                    ]
+                    new_evidence = evidence + [TokenEvidence(
+                        word=vocab.idx2word.get(idx, config.UNK_TOKEN),
+                        confidence=float(math.exp(lp)),
+                        attention=attention,
+                    )]
                 if idx == end_idx or step == max_len - 1:
                     completed.append((new_log_prob, new_ids, new_evidence))
                 else:
                     candidates.append((new_log_prob, new_ids, next_state, new_evidence))
-
         candidates.sort(key=lambda item: _length_penalized(item[0], len(item[1])), reverse=True)
         beams = candidates[:beam_size]
         if not beams:
@@ -306,13 +296,14 @@ def generate_captions(
         if beam_size == 1:
             return [attention_greedy_decode(model, img_tensor, vocab, max_len, temperature)]
         return attention_beam_search_decode(model, img_tensor, vocab, beam_size, max_len, temperature)
-    if beam_size == 1:
-        return [baseline_greedy_decode(model, img_tensor, vocab, max_len)]
-    return baseline_beam_search_decode(model, img_tensor, vocab, beam_size, max_len)
+    if architecture == "baseline":
+        if beam_size == 1:
+            return [baseline_greedy_decode(model, img_tensor, vocab, max_len)]
+        return baseline_beam_search_decode(model, img_tensor, vocab, beam_size, max_len)
+    raise ValueError(f"Unsupported architecture: {architecture}")
 
 
 def attention_grid(token: TokenEvidence) -> Optional[np.ndarray]:
-    """Reshape a flattened attention vector to its square spatial grid."""
     if not token.attention:
         return None
     side = int(round(len(token.attention) ** 0.5))
@@ -353,7 +344,6 @@ def main() -> None:
     args = parse_args()
     vocab = Vocabulary.load()
     model, architecture = load_model(args.model, vocab, config.DEVICE)
-
     if args.image:
         caption_path(args.image, model, architecture, vocab, args)
         return
