@@ -85,6 +85,19 @@ def build_model(
     return ImageCaptioningModel(**common, num_layers=config.NUM_LAYERS)
 
 
+def build_optimizer(model, lr: float, cnn_fine_tuned: bool) -> optim.Optimizer:
+    if cnn_fine_tuned:
+        return optim.Adam(
+            model.parameter_groups(lr, config.CNN_LR_FACTOR),
+            weight_decay=config.WEIGHT_DECAY,
+        )
+    return optim.Adam(
+        model.trainable_parameters(),
+        lr=lr,
+        weight_decay=config.WEIGHT_DECAY,
+    )
+
+
 def checkpoint_payload(model, optimizer, epoch: int, val_loss: float, architecture: str, vocab: Vocabulary) -> dict:
     return {
         "epoch": epoch,
@@ -93,6 +106,7 @@ def checkpoint_payload(model, optimizer, epoch: int, val_loss: float, architectu
         "val_loss": val_loss,
         "vocab_size": len(vocab),
         "architecture": architecture,
+        "cnn_fine_tuned": bool(epoch > config.FREEZE_CNN_EPOCHS),
         "model_config": {
             "embed_dim": config.EMBED_DIM,
             "hidden_dim": config.HIDDEN_DIM,
@@ -102,8 +116,18 @@ def checkpoint_payload(model, optimizer, epoch: int, val_loss: float, architectu
     }
 
 
-def load_checkpoint(path: str, model, optimizer: optim.Optimizer) -> tuple[int, float]:
+def inspect_checkpoint(path: str, expected_architecture: str) -> dict:
     checkpoint = torch.load(path, map_location=config.DEVICE)
+    architecture = checkpoint.get("architecture", "baseline")
+    if architecture != expected_architecture:
+        raise ValueError(
+            f"Checkpoint architecture is {architecture!r}, but --architecture is "
+            f"{expected_architecture!r}. Use the matching architecture."
+        )
+    return checkpoint
+
+
+def restore_checkpoint(checkpoint: dict, model, optimizer: optim.Optimizer) -> tuple[int, float]:
     model.load_state_dict(checkpoint["model_state"])
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     return int(checkpoint["epoch"]) + 1, float(checkpoint["val_loss"])
@@ -144,7 +168,10 @@ def run_epoch(
                     attn_loss = logits.new_tensor(0.0)
 
                 batch, steps, vocab_size = logits.shape
-                token_loss = criterion(logits.reshape(batch * steps, vocab_size), targets.reshape(batch * steps))
+                token_loss = criterion(
+                    logits.reshape(batch * steps, vocab_size),
+                    targets.reshape(batch * steps),
+                )
                 loss = token_loss + config.ATTENTION_REGULARIZATION * attn_loss
 
             if is_train:
@@ -180,30 +207,74 @@ def train(args: argparse.Namespace) -> None:
 
     model = build_model(args.architecture, vocab, glove_matrix).to(config.DEVICE)
     criterion = nn.CrossEntropyLoss(ignore_index=pad_idx, label_smoothing=0.1)
-    optimizer = optim.Adam(model.trainable_parameters(), lr=args.lr, weight_decay=config.WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
 
     start_epoch = 1
     best_val_loss = math.inf
+    resumed_checkpoint = None
+    cnn_fine_tuned = False
+
     if args.resume:
-        start_epoch, best_val_loss = load_checkpoint(args.resume, model, optimizer)
+        resumed_checkpoint = inspect_checkpoint(args.resume, args.architecture)
+        checkpoint_epoch = int(resumed_checkpoint["epoch"])
+        # New checkpoints store the stage explicitly; old checkpoints infer it
+        # from the epoch so resumes remain backwards compatible.
+        cnn_fine_tuned = bool(
+            resumed_checkpoint.get(
+                "cnn_fine_tuned",
+                checkpoint_epoch > config.FREEZE_CNN_EPOCHS,
+            )
+        )
+        model.set_cnn_fine_tune(cnn_fine_tuned)
+
+    optimizer = build_optimizer(model, args.lr, cnn_fine_tuned)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=2,
+    )
+
+    if resumed_checkpoint is not None:
+        start_epoch, best_val_loss = restore_checkpoint(
+            resumed_checkpoint,
+            model,
+            optimizer,
+        )
 
     history: list[dict] = []
     for epoch in range(start_epoch, args.epochs + 1):
         started = time.time()
-        if epoch == config.FREEZE_CNN_EPOCHS + 1:
+
+        if not cnn_fine_tuned and epoch == config.FREEZE_CNN_EPOCHS + 1:
+            cnn_fine_tuned = True
             model.set_cnn_fine_tune(True)
-            optimizer = optim.Adam(
-                model.parameter_groups(args.lr, config.CNN_LR_FACTOR),
-                weight_decay=config.WEIGHT_DECAY,
+            optimizer = build_optimizer(model, args.lr, cnn_fine_tuned=True)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=0.5,
+                patience=2,
             )
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
 
         train_loss, train_attn = run_epoch(
-            model, train_loader, criterion, optimizer, pad_idx, config.DEVICE, args.architecture, "train"
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            pad_idx,
+            config.DEVICE,
+            args.architecture,
+            "train",
         )
         val_loss, val_attn = run_epoch(
-            model, val_loader, criterion, None, pad_idx, config.DEVICE, args.architecture, "val"
+            model,
+            val_loader,
+            criterion,
+            None,
+            pad_idx,
+            config.DEVICE,
+            args.architecture,
+            "val",
         )
         scheduler.step(val_loss)
 
@@ -213,14 +284,25 @@ def train(args: argparse.Namespace) -> None:
             "val_loss": val_loss,
             "train_attention_regularizer": train_attn,
             "val_attention_regularizer": val_attn,
+            "cnn_fine_tuned": cnn_fine_tuned,
             "seconds": round(time.time() - started, 2),
         }
         history.append(record)
         print(json.dumps(record))
 
-        payload = checkpoint_payload(model, optimizer, epoch, val_loss, args.architecture, vocab)
+        payload = checkpoint_payload(
+            model,
+            optimizer,
+            epoch,
+            val_loss,
+            args.architecture,
+            vocab,
+        )
         if epoch % config.SAVE_EVERY_N_EPOCHS == 0:
-            save_checkpoint(payload, os.path.join(config.MODELS_DIR, f"{args.architecture}_epoch_{epoch}.pth"))
+            save_checkpoint(
+                payload,
+                os.path.join(config.MODELS_DIR, f"{args.architecture}_epoch_{epoch}.pth"),
+            )
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             save_checkpoint(payload, config.BEST_MODEL_PATH)
@@ -232,7 +314,11 @@ def train(args: argparse.Namespace) -> None:
         "history": history,
     }
     os.makedirs(config.OUTPUTS_DIR, exist_ok=True)
-    with open(os.path.join(config.OUTPUTS_DIR, "training_summary.json"), "w", encoding="utf-8") as handle:
+    with open(
+        os.path.join(config.OUTPUTS_DIR, "training_summary.json"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
         json.dump(summary, handle, indent=2)
 
 
