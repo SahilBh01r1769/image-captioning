@@ -1,281 +1,188 @@
-# utils/metrics.py
-"""
-BLEU and METEOR evaluation utilities for image captioning.
+"""Dependency-light captioning metrics.
 
-BLEU  — n-gram precision with brevity penalty (corpus-level)
-METEOR— recall-weighted harmonic mean with stemming & synonymy
+BLEU is implemented at corpus level with clipped n-gram precision and the
+standard brevity penalty. ``meteor_lite`` is intentionally named as an
+approximation: it uses exact/stem matching but not WordNet synonym matching.
 """
+from __future__ import annotations
 
-import re
 import math
+import re
 from collections import Counter
-from itertools import chain
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Tokenisation helper
-# ══════════════════════════════════════════════════════════════════════════════
 
 _PUNCT = re.compile(r"[^a-z0-9\s]")
 
-def _tokenize(text: str) -> list[str]:
-    text = text.lower()
-    text = _PUNCT.sub("", text)
-    return text.strip().split()
 
+def tokenize(text: str) -> list[str]:
+    return _PUNCT.sub("", text.lower()).strip().split()
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  BLEU
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _ngram_counts(tokens: list[str], n: int) -> Counter:
-    return Counter(tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1))
+    return Counter(tuple(tokens[i:i + n]) for i in range(max(0, len(tokens) - n + 1)))
 
 
-def _clipped_precision(hypothesis: list[str],
-                        references: list[list[str]],
-                        n: int) -> tuple[int, int]:
-    """
-    Compute clipped n-gram precision counts for one sentence.
-    Returns (clipped_matches, hypothesis_ngram_count).
-    """
+def _clipped_precision(hypothesis: list[str], references: list[list[str]], n: int) -> tuple[int, int]:
     hyp_counts = _ngram_counts(hypothesis, n)
     if not hyp_counts:
         return 0, 0
-
-    # Max reference count for each n-gram
     max_ref_counts: Counter = Counter()
-    for ref in references:
-        ref_counts = _ngram_counts(ref, n)
-        for ngram, cnt in ref_counts.items():
-            max_ref_counts[ngram] = max(max_ref_counts[ngram], cnt)
-
-    clipped = sum(min(cnt, max_ref_counts[ngram])
-                  for ngram, cnt in hyp_counts.items())
+    for reference in references:
+        counts = _ngram_counts(reference, n)
+        for ngram, count in counts.items():
+            max_ref_counts[ngram] = max(max_ref_counts[ngram], count)
+    clipped = sum(min(count, max_ref_counts[ngram]) for ngram, count in hyp_counts.items())
     return clipped, sum(hyp_counts.values())
 
 
-def sentence_bleu(hypothesis: str,
-                   references: list[str],
-                   max_n: int = 4,
-                   smooth: bool = True) -> dict[str, float]:
-    """
-    Compute sentence-level BLEU-1 through BLEU-4 for one hypothesis.
-
-    Parameters
-    ----------
-    hypothesis  : generated caption string
-    references  : list of reference caption strings
-    smooth      : apply +1 smoothing to avoid zero BLEU on short sentences
-    """
-    hyp_tokens  = _tokenize(hypothesis)
-    ref_tokens  = [_tokenize(r) for r in references]
-
-    scores: dict[str, float] = {}
-    log_avg = 0.0
-    valid_n = 0
-
-    for n in range(1, max_n + 1):
-        match, total = _clipped_precision(hyp_tokens, ref_tokens, n)
-        if smooth:
-            match += 1
-            total += 1
-        if total == 0:
-            precision = 0.0
-        else:
-            precision = match / total
-
-        if precision > 0:
-            log_avg += math.log(precision)
-            valid_n += 1
-
-        scores[f"bleu{n}"] = precision
-
-    # Brevity penalty
-    ref_len = min(len(r) for r in ref_tokens)
-    hyp_len = len(hyp_tokens)
-    bp = 1.0 if hyp_len >= ref_len else math.exp(1 - ref_len / max(hyp_len, 1))
-
-    # Cumulative BLEU scores
-    for n in range(1, max_n + 1):
-        cum_log = sum(math.log(max(scores[f"bleu{k}"], 1e-10))
-                      for k in range(1, n + 1)) / n
-        scores[f"bleu{n}_cumulative"] = bp * math.exp(cum_log)
-
-    return scores
+def _closest_reference_length(hyp_len: int, references: list[list[str]]) -> int:
+    lengths = [len(reference) for reference in references]
+    if not lengths:
+        return 0
+    return min(lengths, key=lambda length: (abs(length - hyp_len), length))
 
 
-def corpus_bleu(hypotheses: list[str],
-                references_list: list[list[str]],
-                max_n: int = 4) -> dict[str, float]:
-    """
-    Compute corpus-level BLEU (standard evaluation for captioning).
+def corpus_bleu(
+    hypotheses: list[str],
+    references_list: list[list[str]],
+    max_n: int = 4,
+) -> dict[str, float]:
+    if len(hypotheses) != len(references_list):
+        raise ValueError("hypotheses and references_list must have equal length")
+    if not hypotheses:
+        return {**{f"bleu{n}_cumulative": 0.0 for n in range(1, max_n + 1)}, "brevity_penalty": 0.0}
 
-    Parameters
-    ----------
-    hypotheses       : list of generated captions (one per image)
-    references_list  : list of reference-caption lists (one list per image)
-    """
-    clipped_matches = [0] * (max_n + 1)
-    totals          = [0] * (max_n + 1)
-    hyp_total_len   = 0
-    ref_total_len   = 0
+    matches = [0] * (max_n + 1)
+    totals = [0] * (max_n + 1)
+    hyp_total = 0
+    ref_total = 0
 
-    for hyp, refs in zip(hypotheses, references_list):
-        hyp_tok  = _tokenize(hyp)
-        ref_toks = [_tokenize(r) for r in refs]
-
-        hyp_total_len += len(hyp_tok)
-        # Pick closest reference length
-        ref_total_len += min(
-            len(r) for r in ref_toks
-        )
-
+    for hypothesis, references in zip(hypotheses, references_list):
+        hyp_tokens = tokenize(hypothesis)
+        ref_tokens = [tokenize(reference) for reference in references]
+        hyp_total += len(hyp_tokens)
+        ref_total += _closest_reference_length(len(hyp_tokens), ref_tokens)
         for n in range(1, max_n + 1):
-            m, t = _clipped_precision(hyp_tok, ref_toks, n)
-            clipped_matches[n] += m
-            totals[n] += t
+            clipped, total = _clipped_precision(hyp_tokens, ref_tokens, n)
+            matches[n] += clipped
+            totals[n] += total
 
-    # Brevity penalty
-    bp = (1.0 if hyp_total_len >= ref_total_len
-          else math.exp(1 - ref_total_len / max(hyp_total_len, 1)))
+    if hyp_total == 0:
+        brevity_penalty = 0.0
+    elif hyp_total >= ref_total:
+        brevity_penalty = 1.0
+    else:
+        brevity_penalty = math.exp(1.0 - ref_total / hyp_total)
 
-    scores: dict[str, float] = {}
+    precisions = {
+        n: matches[n] / totals[n] if totals[n] else 0.0
+        for n in range(1, max_n + 1)
+    }
+    scores: dict[str, float] = {"brevity_penalty": brevity_penalty}
     for n in range(1, max_n + 1):
-        p = clipped_matches[n] / max(totals[n], 1)
-        scores[f"bleu{n}"] = p
-
-    for n in range(1, max_n + 1):
-        cum_log = sum(math.log(max(scores[f"bleu{k}"], 1e-10))
-                      for k in range(1, n + 1)) / n
-        scores[f"bleu{n}_cumulative"] = bp * math.exp(cum_log)
-
-    scores["brevity_penalty"] = bp
+        selected = [precisions[k] for k in range(1, n + 1)]
+        if any(value <= 0 for value in selected):
+            cumulative = 0.0
+        else:
+            cumulative = brevity_penalty * math.exp(sum(math.log(value) for value in selected) / n)
+        scores[f"bleu{n}"] = precisions[n]
+        scores[f"bleu{n}_cumulative"] = cumulative
     return scores
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  METEOR  (simplified — no WordNet synonymy, uses Porter-like stemming)
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _stem(word: str) -> str:
-    """
-    Minimal Porter-like stemming (handles most English suffixes).
-    For full METEOR, use nltk.stem.PorterStemmer.
-    """
     if len(word) <= 3:
         return word
-    for suffix in ("ational", "tional", "enci", "anci", "izer", "ising",
-                   "izing", "ated", "ating", "alism", "ness", "ment",
-                   "tion", "ous", "ive", "ful", "ing", "ies", "ers",
-                   "est", "er", "es", "ly", "ed", "s"):
+    for suffix in (
+        "ational", "tional", "enci", "anci", "izer", "ising", "izing",
+        "ated", "ating", "alism", "ness", "ment", "tion", "ous", "ive",
+        "ful", "ing", "ies", "ers", "est", "er", "es", "ly", "ed", "s",
+    ):
         if word.endswith(suffix) and len(word) - len(suffix) > 2:
-            return word[: -len(suffix)]
+            return word[:-len(suffix)]
     return word
 
 
-def sentence_meteor(hypothesis: str,
-                     references: list[str],
-                     alpha: float = 0.9,
-                     beta:  float = 3.0,
-                     gamma: float = 0.5) -> float:
-    """
-    Sentence-level METEOR score.
+def _greedy_matches(hypothesis: list[str], reference: list[str]) -> list[tuple[int, int]]:
+    """Match exact words first, then unmatched stem-equivalent words."""
+    used_ref: set[int] = set()
+    matches: list[tuple[int, int]] = []
+    unmatched_hyp: list[int] = []
 
-    Uses unigram exact match + stemmed match (no synonym match for simplicity).
-    Standard weights: alpha=0.9, beta=3, gamma=0.5
-    """
-    hyp_tokens = _tokenize(hypothesis)
-    if not hyp_tokens:
+    for h_idx, word in enumerate(hypothesis):
+        found = next((r_idx for r_idx, ref_word in enumerate(reference) if r_idx not in used_ref and ref_word == word), None)
+        if found is None:
+            unmatched_hyp.append(h_idx)
+        else:
+            used_ref.add(found)
+            matches.append((h_idx, found))
+
+    for h_idx in unmatched_hyp:
+        stem = _stem(hypothesis[h_idx])
+        found = next(
+            (r_idx for r_idx, ref_word in enumerate(reference) if r_idx not in used_ref and _stem(ref_word) == stem),
+            None,
+        )
+        if found is not None:
+            used_ref.add(found)
+            matches.append((h_idx, found))
+    return sorted(matches)
+
+
+def _chunks(matches: list[tuple[int, int]]) -> int:
+    if not matches:
+        return 0
+    count = 1
+    for previous, current in zip(matches, matches[1:]):
+        if current[0] != previous[0] + 1 or current[1] != previous[1] + 1:
+            count += 1
+    return count
+
+
+def sentence_meteor_lite(hypothesis: str, references: list[str]) -> float:
+    """Approximate METEOR using exact/stem matches and fragmentation penalty."""
+    hyp = tokenize(hypothesis)
+    if not hyp:
         return 0.0
-
     best = 0.0
-    for ref in references:
-        ref_tokens = _tokenize(ref)
-        if not ref_tokens:
+    for reference_text in references:
+        ref = tokenize(reference_text)
+        if not ref:
             continue
-
-        # Exact matches
-        hyp_set = Counter(hyp_tokens)
-        ref_set = Counter(ref_tokens)
-        exact   = sum((hyp_set & ref_set).values())
-
-        # Stem matches on unmatched tokens
-        hyp_unmatched = list(hyp_tokens)
-        ref_unmatched = list(ref_tokens)
-        for w in list(hyp_set & ref_set):
-            count = min(hyp_set[w], ref_set[w])
-            for _ in range(count):
-                if w in hyp_unmatched: hyp_unmatched.remove(w)
-                if w in ref_unmatched: ref_unmatched.remove(w)
-
-        hyp_stems = Counter(_stem(w) for w in hyp_unmatched)
-        ref_stems = Counter(_stem(w) for w in ref_unmatched)
-        stem_match = sum((hyp_stems & ref_stems).values())
-
-        m = exact + stem_match  # total matched unigrams
-
-        precision = m / len(hyp_tokens)
-        recall    = m / len(ref_tokens)
-
-        if precision + recall == 0:
+        matches = _greedy_matches(hyp, ref)
+        matched = len(matches)
+        if matched == 0:
             continue
-
-        f_mean = precision * recall / (alpha * precision + (1 - alpha) * recall)
-
-        # Chunk penalty
-        chunks = _count_chunks(hyp_tokens, ref_tokens)
-        penalty = gamma * (chunks / max(m, 1)) ** beta
-
-        score = f_mean * (1 - penalty)
-        best  = max(best, score)
-
+        precision = matched / len(hyp)
+        recall = matched / len(ref)
+        f_mean = (10.0 * precision * recall) / (recall + 9.0 * precision)
+        penalty = 0.5 * (_chunks(matches) / matched) ** 3
+        best = max(best, f_mean * (1.0 - penalty))
     return best
 
 
-def _count_chunks(hyp: list[str], ref: list[str]) -> int:
-    """Count the number of contiguous matched chunks (for fragmentation penalty)."""
-    ref_pos: dict[str, list[int]] = {}
-    for i, w in enumerate(ref):
-        ref_pos.setdefault(w, []).append(i)
-
-    matched_ref_indices: list[int] = []
-    for word in hyp:
-        if word in ref_pos and ref_pos[word]:
-            matched_ref_indices.append(ref_pos[word].pop(0))
-
-    if not matched_ref_indices:
-        return 0
-
-    chunks = 1
-    for i in range(1, len(matched_ref_indices)):
-        if matched_ref_indices[i] != matched_ref_indices[i - 1] + 1:
-            chunks += 1
-    return chunks
-
-
-def corpus_meteor(hypotheses: list[str],
-                  references_list: list[list[str]]) -> float:
-    """Average sentence METEOR across the corpus."""
+def corpus_meteor_lite(hypotheses: list[str], references_list: list[list[str]]) -> float:
     if not hypotheses:
         return 0.0
     return sum(
-        sentence_meteor(h, refs)
-        for h, refs in zip(hypotheses, references_list)
+        sentence_meteor_lite(hypothesis, references)
+        for hypothesis, references in zip(hypotheses, references_list)
     ) / len(hypotheses)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Pretty-print summary
-# ══════════════════════════════════════════════════════════════════════════════
+def distinct_n(hypotheses: list[str], n: int = 1) -> float:
+    """Ratio of unique generated n-grams; a simple caption-diversity signal."""
+    all_ngrams: list[tuple[str, ...]] = []
+    for caption in hypotheses:
+        tokens = tokenize(caption)
+        all_ngrams.extend(tuple(tokens[i:i + n]) for i in range(max(0, len(tokens) - n + 1)))
+    return len(set(all_ngrams)) / len(all_ngrams) if all_ngrams else 0.0
 
-def print_scores(bleu: dict[str, float], meteor: float) -> None:
-    print("\n" + "═" * 40)
-    print("  Evaluation Results")
-    print("═" * 40)
-    print(f"  BLEU-1  : {bleu['bleu1_cumulative']:.4f}")
-    print(f"  BLEU-2  : {bleu['bleu2_cumulative']:.4f}")
-    print(f"  BLEU-3  : {bleu['bleu3_cumulative']:.4f}")
-    print(f"  BLEU-4  : {bleu['bleu4_cumulative']:.4f}")
-    print(f"  METEOR  : {meteor:.4f}")
-    print("═" * 40 + "\n")
+
+def caption_statistics(hypotheses: list[str]) -> dict[str, float]:
+    lengths = [len(tokenize(caption)) for caption in hypotheses]
+    return {
+        "mean_caption_length": sum(lengths) / len(lengths) if lengths else 0.0,
+        "distinct_1": distinct_n(hypotheses, 1),
+        "distinct_2": distinct_n(hypotheses, 2),
+    }
