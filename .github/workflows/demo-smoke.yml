@@ -1,0 +1,32 @@
+name: hosted demo smoke
+
+on:
+  push:
+    branches: [portfolio/explainable-attention-captioning, demo/hosted-captioning]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: demo/requirements.txt
+      - name: Install demo dependencies
+        run: pip install -r demo/requirements.txt
+      - name: Compile demo
+        run: python -m py_compile demo/app.py inference.py attention_model.py model.py vocabulary.py config.py
+      - name: Start Streamlit
+        run: |
+          streamlit run demo/app.py --server.headless true --server.port 8501 > /tmp/streamlit.log 2>&1 &
+          APP_PID=$!
+          trap 'kill $APP_PID || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8501/_stcore/health; then exit 0; fi
+            sleep 1
+          done
+          cat /tmp/streamlit.log
+          exit 1
