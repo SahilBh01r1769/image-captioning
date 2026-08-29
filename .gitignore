@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+.DS_Store
+
+# Datasets and external embeddings
+data/
+
+# Generated training artifacts
+models/*.pth
+models/*.pt
+models/*.pkl
+outputs/*
+!models/.gitkeep
+!outputs/.gitkeep
+
+# Streamlit local secrets
+.streamlit/secrets.toml
