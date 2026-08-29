@@ -1,0 +1,27 @@
+name: tests
+
+on:
+  push:
+    branches: [main, portfolio/explainable-attention-captioning, demo/hosted-captioning]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install CPU PyTorch
+        run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      - name: Install project dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Compile
+        run: python -m compileall -q config.py model.py attention_model.py dataset.py vocabulary.py inference.py evaluate.py train.py metrics.py tests
+      - name: Test
+        run: python -m pytest -q
