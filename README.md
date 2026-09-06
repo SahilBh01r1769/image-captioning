@@ -186,9 +186,11 @@ data/
     └── captions.txt
 ```
 
-One image has multiple reference captions. The split is performed **by image key**, not by flattened `(image, caption)` rows, so captions for the same image cannot appear in both training and evaluation sets.
+One image has multiple reference captions. The split is performed **by image key**, not by flattened `(image, caption)` rows, so captions for the same image cannot appear in both training and evaluation sets. The first training run writes a fingerprinted manifest to `splits/flickr8k_seed42.json`; later runs reject the manifest if the dataset or split settings have changed.
 
-The split is deterministic using the configured random seed. Because this repository uses its own seeded 80/10/10 image split, metrics should not be compared directly with papers using a different Flickr8k split protocol unless the split definitions are aligned.
+The vocabulary is built from the training captions only. Words that occur only in validation or test references become `<UNK>` instead of influencing the model's output space. The training entrypoint reports the validation and test unknown-token rates so that consequence is visible rather than hidden.
+
+The split is deterministic using the configured random seed. Because this repository uses its own frozen 80/10/10 image split, metrics should not be compared directly with papers using a different Flickr8k split protocol unless the split definitions are aligned.
 
 ---
 
@@ -216,6 +218,12 @@ python train.py --no_glove
 
 ```bash
 python train.py --architecture attention
+```
+
+If an older cached vocabulary predates the frozen data protocol, training stops instead of silently reusing it. Rebuild it deliberately after reviewing the split:
+
+```bash
+python train.py --architecture attention --rebuild_vocab
 ```
 
 ### Global-vector baseline
