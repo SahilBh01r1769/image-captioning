@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import random
 from collections import defaultdict
 
 from PIL import Image
@@ -11,6 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as T
 
 import config
+from data_protocol import create_split_manifest, load_or_create_split_manifest
 from vocabulary import Vocabulary
 
 
@@ -19,7 +19,6 @@ def get_transform(split: str = "train") -> T.Compose:
         return T.Compose([
             T.Resize(256),
             T.RandomCrop(config.IMAGE_SIZE),
-            T.RandomHorizontalFlip(),
             T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
             T.ToTensor(),
             T.Normalize(mean=config.IMAGE_MEAN, std=config.IMAGE_STD),
@@ -71,16 +70,31 @@ def split_dataset(
     if train <= 0 or val < 0 or train + val >= 1:
         raise ValueError("train and val fractions must leave a non-empty test split")
 
-    keys = sorted(image_captions)
-    rng = random.Random(seed)
-    rng.shuffle(keys)
-    n = len(keys)
-    n_train = int(n * train)
-    n_val = int(n * val)
+    manifest = create_split_manifest(
+        image_captions,
+        train_fraction=train,
+        val_fraction=val,
+        seed=seed,
+    )
+    splits = manifest["splits"]
     return (
-        keys[:n_train],
-        keys[n_train:n_train + n_val],
-        keys[n_train + n_val:],
+        splits["train"],
+        splits["validation"],
+        splits["test"],
+    )
+
+
+def resolve_dataset_split(
+    image_captions: dict[str, list[str]],
+    manifest_path: str = config.SPLIT_MANIFEST_PATH,
+) -> dict:
+    """Return the frozen CaptionLab split, creating it on the first run."""
+    return load_or_create_split_manifest(
+        image_captions,
+        manifest_path,
+        train_fraction=config.TRAIN_SPLIT,
+        val_fraction=config.VAL_SPLIT,
+        seed=config.SEED,
     )
 
 
@@ -131,7 +145,10 @@ def build_dataloaders(
     num_workers: int = 4,
 ) -> tuple[DataLoader, DataLoader, DataLoader, dict[str, list[str]]]:
     image_captions = parse_captions()
-    train_keys, val_keys, test_keys = split_dataset(image_captions)
+    split_manifest = resolve_dataset_split(image_captions)
+    train_keys = split_manifest["splits"]["train"]
+    val_keys = split_manifest["splits"]["validation"]
+    test_keys = split_manifest["splits"]["test"]
     train_ds = Flickr8kDataset(train_keys, image_captions, vocabulary, split="train")
     val_ds = Flickr8kDataset(val_keys, image_captions, vocabulary, split="val")
     test_ds = Flickr8kDataset(test_keys, image_captions, vocabulary, split="test")

@@ -12,6 +12,9 @@ from tqdm import tqdm
 import config
 
 
+TOKENIZER_VERSION = 1
+
+
 class Vocabulary:
     """Word/index mapping with explicit special-token handling."""
 
@@ -19,6 +22,7 @@ class Vocabulary:
         self.word2idx: dict[str, int] = {}
         self.idx2word: dict[int, str] = {}
         self.word_freq: Counter = Counter()
+        self.metadata: dict = {}
         self._idx = 0
         for token in [config.PAD_TOKEN, config.START_TOKEN, config.END_TOKEN, config.UNK_TOKEN]:
             self._add_word(token)
@@ -92,6 +96,14 @@ class Vocabulary:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as handle:
             pickle.dump(self, handle)
+
+    def unknown_token_rate(self, captions: list[str]) -> float:
+        """Return the fraction of lexical tokens mapped to ``<UNK>``."""
+        tokens = [token for caption in captions for token in tokenize(caption)]
+        if not tokens:
+            return 0.0
+        unknown = sum(token not in self.word2idx for token in tokens)
+        return unknown / len(tokens)
 
     @staticmethod
     def load(path: str = config.VOCAB_PATH) -> "Vocabulary":

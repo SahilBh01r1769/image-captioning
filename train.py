@@ -17,9 +17,10 @@ from tqdm import tqdm
 
 import config
 from attention_model import ExplainableCaptioningModel, attention_coverage_loss
-from dataset import build_dataloaders, parse_captions
+from data_protocol import captions_for_images
+from dataset import build_dataloaders, parse_captions, resolve_dataset_split
 from model import ImageCaptioningModel
-from vocabulary import Vocabulary
+from vocabulary import TOKENIZER_VERSION, Vocabulary
 
 
 def seed_everything(seed: int = config.SEED) -> None:
@@ -39,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--no_glove", action="store_true")
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--rebuild_vocab", action="store_true")
     return parser.parse_args()
 
 
@@ -47,15 +49,55 @@ def save_checkpoint(state: dict, path: str) -> None:
     torch.save(state, path)
 
 
-def build_vocabulary() -> Vocabulary:
-    if os.path.exists(config.VOCAB_PATH):
-        return Vocabulary.load()
-    image_captions = parse_captions()
-    captions = [caption for group in image_captions.values() for caption in group]
+def build_vocabulary(
+    image_captions: dict[str, list[str]],
+    split_manifest: dict,
+    *,
+    rebuild: bool = False,
+) -> Vocabulary:
+    """Build vocabulary from training captions only and bind it to this split."""
+    train_keys = split_manifest["splits"]["train"]
+    captions = captions_for_images(image_captions, train_keys)
+    expected_metadata = {
+        "protocol_version": split_manifest["protocol_version"],
+        "dataset_fingerprint": split_manifest["dataset_fingerprint"],
+        "split_fingerprint": split_manifest["split_fingerprint"],
+        "training_images": len(train_keys),
+        "minimum_word_frequency": config.MIN_WORD_FREQ,
+        "tokenizer_version": TOKENIZER_VERSION,
+        "source": "training captions only",
+    }
+    if os.path.exists(config.VOCAB_PATH) and not rebuild:
+        vocab = Vocabulary.load()
+        if getattr(vocab, "metadata", {}) != expected_metadata:
+            raise RuntimeError(
+                "Cached vocabulary does not match the frozen data protocol. "
+                "Re-run with --rebuild_vocab after reviewing the split change."
+            )
+        return vocab
+
     vocab = Vocabulary()
     vocab.build_from_captions(captions)
+    vocab.metadata = expected_metadata
     vocab.save()
     return vocab
+
+
+def vocabulary_diagnostics(
+    vocab: Vocabulary,
+    image_captions: dict[str, list[str]],
+    split_manifest: dict,
+) -> dict[str, float | int]:
+    splits = split_manifest["splits"]
+    return {
+        "vocabulary_size": len(vocab),
+        "validation_unknown_token_rate": vocab.unknown_token_rate(
+            captions_for_images(image_captions, splits["validation"])
+        ),
+        "test_unknown_token_rate": vocab.unknown_token_rate(
+            captions_for_images(image_captions, splits["test"])
+        ),
+    }
 
 
 def build_model(
@@ -192,7 +234,10 @@ def run_epoch(
 
 def train(args: argparse.Namespace) -> None:
     seed_everything()
-    vocab = build_vocabulary()
+    image_captions = parse_captions()
+    split_manifest = resolve_dataset_split(image_captions)
+    vocab = build_vocabulary(image_captions, split_manifest, rebuild=args.rebuild_vocab)
+    print(json.dumps({"data_protocol": vocabulary_diagnostics(vocab, image_captions, split_manifest)}))
     pad_idx = vocab[config.PAD_TOKEN]
 
     glove_matrix = None

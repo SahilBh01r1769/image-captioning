@@ -14,10 +14,12 @@ GLOVE_FILE = os.path.join(GLOVE_DIR, "glove.6B.200d.txt")
 
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 OUTPUTS_DIR = os.path.join(BASE_DIR, "outputs")
+SPLITS_DIR = os.path.join(BASE_DIR, "splits")
 VOCAB_PATH = os.path.join(MODELS_DIR, "vocabulary.pkl")
 BEST_MODEL_PATH = os.path.join(MODELS_DIR, "best_model.pth")
+SPLIT_MANIFEST_PATH = os.path.join(SPLITS_DIR, "flickr8k_seed42.json")
 
-for directory in [MODELS_DIR, OUTPUTS_DIR]:
+for directory in [MODELS_DIR, OUTPUTS_DIR, SPLITS_DIR]:
     os.makedirs(directory, exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

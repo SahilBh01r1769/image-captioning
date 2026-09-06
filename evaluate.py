@@ -8,7 +8,7 @@ import os
 from tqdm import tqdm
 
 import config
-from dataset import parse_captions, split_dataset
+from dataset import parse_captions, resolve_dataset_split
 from inference import generate_captions, load_image, load_model
 from metrics import caption_statistics, corpus_bleu, corpus_meteor_lite
 from vocabulary import Vocabulary
@@ -27,7 +27,10 @@ def evaluate(args: argparse.Namespace) -> dict:
     vocab = Vocabulary.load()
     model, architecture = load_model(args.model, vocab, config.DEVICE)
     image_captions = parse_captions()
-    _, _, test_keys = split_dataset(image_captions)
+    split_manifest = resolve_dataset_split(image_captions)
+    if getattr(vocab, "metadata", {}).get("split_fingerprint") != split_manifest["split_fingerprint"]:
+        raise RuntimeError("Vocabulary and evaluation split were not created by the same data protocol")
+    test_keys = split_manifest["splits"]["test"]
     if args.max_images is not None:
         test_keys = test_keys[: max(0, args.max_images)]
 
