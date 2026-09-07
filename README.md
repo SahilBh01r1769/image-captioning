@@ -17,7 +17,7 @@ The result is not just a caption generator. It is a small research-oriented capt
 
 | Component | What it adds |
 |---|---|
-| **Baseline architecture** | A simple global-image-vector encoder/decoder for controlled comparison |
+| **Baseline architecture** | Globally pools the same frozen feature grid used by attention |
 | **Spatial ResNet50 encoder** | Preserves the final visual feature grid instead of averaging the image into one vector |
 | **Additive attention** | Learns a different weighting over image regions for each generated word |
 | **Attention coverage regularization** | Encourages the decoder to distribute visual attention across meaningful regions during a caption |
@@ -92,13 +92,13 @@ These maps are **model attention weights, not object-detection boxes and not pro
 
 ## Training objective
 
-Caption training uses teacher forcing with cross-entropy over the next word. For the attention architecture, the total objective also includes a coverage term inspired by *Show, Attend and Tell*:
+Caption training uses teacher forcing with cross-entropy over the next word. Coverage is an explicit attention ablation rather than an assumed improvement. When its coefficient is non-zero, the objective is:
 
 ```text
 loss = caption_cross_entropy + λ × attention_coverage_loss
 ```
 
-Padding steps are masked out of the regularizer so artificial `<PAD>` positions do not influence spatial coverage.
+Padding steps are masked out of the regularizer so artificial `<PAD>` positions do not influence spatial coverage. Plain attention uses `λ = 0`; a separate run must justify any non-zero value.
 
 The CNN backbone starts frozen. After the configured warm-up period, it is unfrozen and optimized at a lower learning rate than the captioning layers.
 
@@ -110,6 +110,9 @@ The CNN backbone starts frozen. After the configured warm-up period, it is unfro
 .
 ├── attention_model.py          # spatial CNN + additive attention + LSTMCell
 ├── model.py                    # original global-vector baseline
+├── visual_features.py          # shared frozen ResNet50 spatial representation
+├── feature_cache.py            # validated float16 cache + caption loaders
+├── extract_features.py         # one-time deterministic feature extraction
 ├── train.py                    # dual-architecture training pipeline
 ├── inference.py                # greedy/beam decoding + token evidence
 ├── evaluate.py                 # reproducible test-split evaluation
@@ -213,6 +216,25 @@ python train.py --no_glove
 ---
 
 ## Train
+
+For the controlled, compute-efficient comparison, extract the frozen ResNet50 grid once:
+
+```bash
+python extract_features.py
+```
+
+Both ablations then train from that same cache. The baseline globally averages it; the attention decoder retains its spatial locations:
+
+```bash
+python train.py --architecture baseline --cached_features --no_glove
+python train.py --architecture attention --cached_features --no_glove
+```
+
+Coverage is enabled only for its own ablation by supplying a deliberately selected coefficient:
+
+```bash
+python train.py --architecture attention --cached_features --no_glove --coverage_lambda <chosen-value>
+```
 
 ### Attention model — primary research path
 
