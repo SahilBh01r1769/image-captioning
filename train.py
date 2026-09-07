@@ -80,7 +80,7 @@ def build_vocabulary(
         "source": "training captions only",
     }
     if os.path.exists(config.VOCAB_PATH) and not rebuild:
-        vocab = Vocabulary.load()
+        vocab = Vocabulary.load(config.VOCAB_PATH)
         if getattr(vocab, "metadata", {}) != expected_metadata:
             raise RuntimeError(
                 "Cached vocabulary does not match the frozen data protocol. "
@@ -91,7 +91,7 @@ def build_vocabulary(
     vocab = Vocabulary()
     vocab.build_from_captions(captions)
     vocab.metadata = expected_metadata
-    vocab.save()
+    vocab.save(config.VOCAB_PATH)
     return vocab
 
 
