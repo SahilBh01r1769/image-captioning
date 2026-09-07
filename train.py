@@ -19,6 +19,7 @@ import config
 from attention_model import ExplainableCaptioningModel, attention_coverage_loss
 from data_protocol import captions_for_images
 from dataset import build_dataloaders, parse_captions, resolve_dataset_split
+from feature_cache import build_cached_feature_dataloaders
 from model import ImageCaptioningModel
 from vocabulary import TOKENIZER_VERSION, Vocabulary
 
@@ -41,6 +42,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_glove", action="store_true")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--rebuild_vocab", action="store_true")
+    parser.add_argument(
+        "--cached_features",
+        action="store_true",
+        help="Train from the shared frozen ResNet feature cache",
+    )
+    parser.add_argument(
+        "--coverage_lambda",
+        type=float,
+        default=config.ATTENTION_REGULARIZATION,
+        help="Coverage coefficient; zero is the default attention ablation",
+    )
     return parser.parse_args()
 
 
@@ -140,7 +152,16 @@ def build_optimizer(model, lr: float, cnn_fine_tuned: bool) -> optim.Optimizer:
     )
 
 
-def checkpoint_payload(model, optimizer, epoch: int, val_loss: float, architecture: str, vocab: Vocabulary) -> dict:
+def checkpoint_payload(
+    model,
+    optimizer,
+    epoch: int,
+    val_loss: float,
+    architecture: str,
+    vocab: Vocabulary,
+    *,
+    cnn_fine_tuned: bool,
+) -> dict:
     return {
         "epoch": epoch,
         "model_state": model.state_dict(),
@@ -148,7 +169,7 @@ def checkpoint_payload(model, optimizer, epoch: int, val_loss: float, architectu
         "val_loss": val_loss,
         "vocab_size": len(vocab),
         "architecture": architecture,
-        "cnn_fine_tuned": bool(epoch > config.FREEZE_CNN_EPOCHS),
+        "cnn_fine_tuned": cnn_fine_tuned,
         "model_config": {
             "embed_dim": config.EMBED_DIM,
             "hidden_dim": config.HIDDEN_DIM,
@@ -184,6 +205,9 @@ def run_epoch(
     device: torch.device,
     architecture: str,
     split: str,
+    *,
+    cached_features: bool = False,
+    coverage_lambda: float = config.ATTENTION_REGULARIZATION,
 ) -> tuple[float, float]:
     """Return token-normalized total loss and attention regularization."""
     is_train = optimizer is not None
@@ -201,7 +225,11 @@ def run_epoch(
             valid_steps = targets != pad_idx
 
             with torch.set_grad_enabled(is_train):
-                output = model(images, captions)
+                output = (
+                    model.forward_from_features(images, captions)
+                    if cached_features
+                    else model(images, captions)
+                )
                 if architecture == "attention":
                     logits, alphas = output
                     attn_loss = attention_coverage_loss(alphas, valid_steps)
@@ -214,7 +242,7 @@ def run_epoch(
                     logits.reshape(batch * steps, vocab_size),
                     targets.reshape(batch * steps),
                 )
-                loss = token_loss + config.ATTENTION_REGULARIZATION * attn_loss
+                loss = token_loss + coverage_lambda * attn_loss
 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
@@ -233,6 +261,10 @@ def run_epoch(
 
 
 def train(args: argparse.Namespace) -> None:
+    if args.coverage_lambda < 0:
+        raise ValueError("--coverage_lambda must be non-negative")
+    if args.architecture == "baseline" and args.coverage_lambda != 0:
+        raise ValueError("coverage regularization applies only to the attention model")
     seed_everything()
     image_captions = parse_captions()
     split_manifest = resolve_dataset_split(image_captions)
@@ -244,13 +276,19 @@ def train(args: argparse.Namespace) -> None:
     if config.USE_GLOVE and not args.no_glove and os.path.exists(config.GLOVE_FILE):
         glove_matrix = vocab.build_glove_matrix()
 
-    train_loader, val_loader, _, _ = build_dataloaders(
-        vocab,
-        batch_size=args.batch_size,
-        num_workers=args.workers,
+    loader_factory = (
+        build_cached_feature_dataloaders if args.cached_features else build_dataloaders
+    )
+    train_loader, val_loader, _, _ = loader_factory(
+        vocab, batch_size=args.batch_size, num_workers=args.workers
     )
 
-    model = build_model(args.architecture, vocab, glove_matrix).to(config.DEVICE)
+    model = build_model(
+        args.architecture,
+        vocab,
+        glove_matrix,
+        pretrained_encoder=not args.cached_features,
+    ).to(config.DEVICE)
     criterion = nn.CrossEntropyLoss(ignore_index=pad_idx, label_smoothing=0.1)
 
     start_epoch = 1
@@ -290,7 +328,11 @@ def train(args: argparse.Namespace) -> None:
     for epoch in range(start_epoch, args.epochs + 1):
         started = time.time()
 
-        if not cnn_fine_tuned and epoch == config.FREEZE_CNN_EPOCHS + 1:
+        if (
+            not args.cached_features
+            and not cnn_fine_tuned
+            and epoch == config.FREEZE_CNN_EPOCHS + 1
+        ):
             cnn_fine_tuned = True
             model.set_cnn_fine_tune(True)
             optimizer = build_optimizer(model, args.lr, cnn_fine_tuned=True)
@@ -310,6 +352,8 @@ def train(args: argparse.Namespace) -> None:
             config.DEVICE,
             args.architecture,
             "train",
+            cached_features=args.cached_features,
+            coverage_lambda=args.coverage_lambda,
         )
         val_loss, val_attn = run_epoch(
             model,
@@ -320,6 +364,8 @@ def train(args: argparse.Namespace) -> None:
             config.DEVICE,
             args.architecture,
             "val",
+            cached_features=args.cached_features,
+            coverage_lambda=args.coverage_lambda,
         )
         scheduler.step(val_loss)
 
@@ -330,6 +376,8 @@ def train(args: argparse.Namespace) -> None:
             "train_attention_regularizer": train_attn,
             "val_attention_regularizer": val_attn,
             "cnn_fine_tuned": cnn_fine_tuned,
+            "coverage_lambda": args.coverage_lambda,
+            "cached_features": args.cached_features,
             "seconds": round(time.time() - started, 2),
         }
         history.append(record)
@@ -342,6 +390,7 @@ def train(args: argparse.Namespace) -> None:
             val_loss,
             args.architecture,
             vocab,
+            cnn_fine_tuned=cnn_fine_tuned,
         )
         if epoch % config.SAVE_EVERY_N_EPOCHS == 0:
             save_checkpoint(
