@@ -1,4 +1,4 @@
-"""Baseline image-captioning model: global ResNet50 vector + stacked LSTM.
+"""Baseline image-captioning model: global ResNet50 vector + one-layer LSTM.
 
 This module is intentionally kept as an ablation baseline. The primary model
 lives in ``attention_model.py`` and preserves spatial image features.
@@ -10,9 +10,9 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
-import torchvision.models as tv_models
 
 import config
+from visual_features import SpatialResNetBackbone, global_average_pool
 
 
 class CNNEncoder(nn.Module):
@@ -25,20 +25,11 @@ class CNNEncoder(nn.Module):
         pretrained: bool = True,
     ):
         super().__init__()
-        if pretrained:
-            try:
-                resnet = tv_models.resnet50(weights=tv_models.ResNet50_Weights.IMAGENET1K_V1)
-            except Exception as exc:
-                raise RuntimeError(
-                    "Could not load pretrained ResNet50 weights. Connect to the internet "
-                    "for first-time training or instantiate with pretrained=False for tests."
-                ) from exc
-        else:
-            resnet = tv_models.resnet50(weights=None)
-
-        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
+        self.feature_extractor = SpatialResNetBackbone(
+            fine_tune=fine_tune,
+            pretrained=pretrained,
+        )
         self.projection = nn.Sequential(
-            nn.Flatten(),
             nn.Linear(config.CNN_FEAT_DIM, embed_dim),
             nn.ReLU(),
             nn.Dropout(config.DROPOUT),
@@ -46,20 +37,20 @@ class CNNEncoder(nn.Module):
         self.set_fine_tune(fine_tune)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        with torch.set_grad_enabled(self.fine_tune):
-            features = self.backbone(images)
-        return self.projection(features)
+        return self.forward_features(self.feature_extractor(images))
+
+    def forward_features(self, spatial_features: torch.Tensor) -> torch.Tensor:
+        return self.projection(global_average_pool(spatial_features))
 
     def set_fine_tune(self, enable: bool) -> None:
         self.fine_tune = enable
-        for parameter in self.backbone.parameters():
-            parameter.requires_grad = enable
+        self.feature_extractor.set_fine_tune(enable)
         for parameter in self.projection.parameters():
             parameter.requires_grad = True
 
 
 class LSTMDecoder(nn.Module):
-    """Teacher-forced stacked-LSTM caption decoder for the baseline model."""
+    """Teacher-forced LSTM caption decoder for the global-vector baseline."""
 
     def __init__(
         self,
@@ -158,6 +149,14 @@ class ImageCaptioningModel(nn.Module):
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         return self.encoder(images)
 
+    def encode_features(self, spatial_features: torch.Tensor) -> torch.Tensor:
+        return self.encoder.forward_features(spatial_features)
+
+    def forward_from_features(
+        self, spatial_features: torch.Tensor, captions: torch.Tensor
+    ) -> torch.Tensor:
+        return self.decoder(self.encode_features(spatial_features), captions)
+
     def set_cnn_fine_tune(self, enable: bool) -> None:
         self.encoder.set_fine_tune(enable)
 
@@ -165,7 +164,7 @@ class ImageCaptioningModel(nn.Module):
         return [parameter for parameter in self.parameters() if parameter.requires_grad]
 
     def parameter_groups(self, lr: float, cnn_lr_factor: float) -> list[dict]:
-        cnn_params = list(self.encoder.backbone.parameters())
+        cnn_params = list(self.encoder.feature_extractor.parameters())
         cnn_ids = {id(parameter) for parameter in cnn_params}
         other = [
             parameter for parameter in self.parameters()

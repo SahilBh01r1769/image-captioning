@@ -11,6 +11,8 @@ IMAGES_DIR = os.path.join(FLICKR8K_DIR, "Images")
 CAPTIONS_FILE = os.path.join(FLICKR8K_DIR, "captions.txt")
 GLOVE_DIR = os.path.join(DATA_DIR, "glove")
 GLOVE_FILE = os.path.join(GLOVE_DIR, "glove.6B.200d.txt")
+FEATURE_CACHE_DIR = os.path.join(DATA_DIR, "feature_cache")
+FEATURE_CACHE_PATH = os.path.join(FEATURE_CACHE_DIR, "flickr8k_resnet50_spatial.pt")
 
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 OUTPUTS_DIR = os.path.join(BASE_DIR, "outputs")
@@ -45,13 +47,15 @@ CNN_BACKBONE = "resnet50"
 CNN_FEAT_DIM = 2048
 EMBED_DIM = 512
 HIDDEN_DIM = 512
-NUM_LAYERS = 2
+# Both ablations use one recurrent layer so decoder depth is not a confounder.
+NUM_LAYERS = 1
 DROPOUT = 0.5
 
 # Explainable spatial-attention model
 ATTENTION_ENCODER_DIM = 512
 ATTENTION_DIM = 512
-ATTENTION_REGULARIZATION = 0.7
+# Coverage is an explicit ablation, not part of the default attention model.
+ATTENTION_REGULARIZATION = 0.0
 
 # GloVe
 USE_GLOVE = True

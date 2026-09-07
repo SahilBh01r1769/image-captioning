@@ -12,9 +12,9 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
-import torchvision.models as tv_models
 
 import config
+from visual_features import SpatialResNetBackbone
 
 
 class SpatialCNNEncoder(nn.Module):
@@ -27,36 +27,31 @@ class SpatialCNNEncoder(nn.Module):
         pretrained: bool = True,
     ):
         super().__init__()
-        if pretrained:
-            try:
-                resnet = tv_models.resnet50(weights=tv_models.ResNet50_Weights.IMAGENET1K_V1)
-            except Exception as exc:
-                raise RuntimeError(
-                    "Could not load pretrained ResNet50 weights. Connect to the internet "
-                    "for first-time training or instantiate with pretrained=False for tests."
-                ) from exc
-        else:
-            resnet = tv_models.resnet50(weights=None)
-
-        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+        self.feature_extractor = SpatialResNetBackbone(
+            fine_tune=fine_tune,
+            pretrained=pretrained,
+        )
         self.projection = nn.Sequential(
-            nn.Conv2d(config.CNN_FEAT_DIM, encoder_dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(encoder_dim),
+            nn.Linear(config.CNN_FEAT_DIM, encoder_dim, bias=False),
+            nn.LayerNorm(encoder_dim),
             nn.ReLU(inplace=True),
         )
         self.encoder_dim = encoder_dim
         self.set_fine_tune(fine_tune)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        with torch.set_grad_enabled(self.fine_tune):
-            features = self.backbone(images)
-        features = self.projection(features)
-        return features.flatten(2).transpose(1, 2).contiguous()
+        return self.forward_features(self.feature_extractor(images))
+
+    def forward_features(self, spatial_features: torch.Tensor) -> torch.Tensor:
+        if spatial_features.ndim != 3 or spatial_features.size(-1) != config.CNN_FEAT_DIM:
+            raise ValueError(
+                f"expected spatial features shaped (batch, locations, {config.CNN_FEAT_DIM})"
+            )
+        return self.projection(spatial_features)
 
     def set_fine_tune(self, enable: bool) -> None:
         self.fine_tune = enable
-        for parameter in self.backbone.parameters():
-            parameter.requires_grad = enable
+        self.feature_extractor.set_fine_tune(enable)
         for parameter in self.projection.parameters():
             parameter.requires_grad = True
 
@@ -198,6 +193,14 @@ class ExplainableCaptioningModel(nn.Module):
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         return self.encoder(images)
 
+    def encode_features(self, spatial_features: torch.Tensor) -> torch.Tensor:
+        return self.encoder.forward_features(spatial_features)
+
+    def forward_from_features(
+        self, spatial_features: torch.Tensor, captions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.decoder(self.encode_features(spatial_features), captions)
+
     def set_cnn_fine_tune(self, enable: bool) -> None:
         self.encoder.set_fine_tune(enable)
 
@@ -205,7 +208,7 @@ class ExplainableCaptioningModel(nn.Module):
         return [parameter for parameter in self.parameters() if parameter.requires_grad]
 
     def parameter_groups(self, lr: float, cnn_lr_factor: float) -> list[dict]:
-        cnn_params = list(self.encoder.backbone.parameters())
+        cnn_params = list(self.encoder.feature_extractor.parameters())
         cnn_ids = {id(parameter) for parameter in cnn_params}
         other = [
             parameter for parameter in self.parameters()
