@@ -2,7 +2,7 @@ name: tests
 
 on:
   push:
-    branches: [main, portfolio/explainable-attention-captioning, demo/hosted-captioning]
+    branches: [main, portfolio/explainable-attention-captioning, demo/hosted-captioning, refactor/controlled-captioning-experiment]
   pull_request:
     branches: [main]
 
