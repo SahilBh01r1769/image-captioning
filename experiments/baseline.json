@@ -1,0 +1,19 @@
+{
+  "run_name": "baseline_seed42",
+  "architecture": "baseline",
+  "seed": 42,
+  "epochs": 20,
+  "batch_size": 64,
+  "learning_rate": 0.0003,
+  "weight_decay": 0.0001,
+  "embedding_dim": 256,
+  "hidden_dim": 256,
+  "attention_encoder_dim": 256,
+  "attention_dim": 256,
+  "dropout": 0.3,
+  "coverage_lambda": 0.0,
+  "label_smoothing": 0.0,
+  "clip_grad_norm": 5.0,
+  "early_stopping_patience": 4,
+  "schema_version": 1
+}
