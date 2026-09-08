@@ -1,11 +1,15 @@
-"""Training entrypoint for baseline and explainable attention captioners."""
+"""Reproducible runner for CaptionLab's three controlled experiments."""
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import math
 import os
+from pathlib import Path
+import platform
 import random
+import sys
 import time
 
 import numpy as np
@@ -18,13 +22,27 @@ from tqdm import tqdm
 import config
 from attention_model import ExplainableCaptioningModel, attention_coverage_loss
 from data_protocol import captions_for_images
-from dataset import build_dataloaders, parse_captions, resolve_dataset_split
+from dataset import parse_captions, resolve_dataset_split
+from experiment import ExperimentConfig
 from feature_cache import build_cached_feature_dataloaders
 from model import ImageCaptioningModel
+from run_artifacts import (
+    atomic_torch_save,
+    atomic_write_json,
+    git_revision,
+    load_trainable_model_state,
+    prepare_run_directory,
+    stable_hash,
+    trainable_model_state,
+)
 from vocabulary import TOKENIZER_VERSION, Vocabulary
 
 
-def seed_everything(seed: int = config.SEED) -> None:
+DEFAULT_EXPERIMENT = os.path.join(config.BASE_DIR, "experiments", "attention.json")
+DEFAULT_RUNS_DIR = os.path.join(config.BASE_DIR, "runs")
+
+
+def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -33,32 +51,24 @@ def seed_everything(seed: int = config.SEED) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train an image-captioning model")
-    parser.add_argument("--architecture", choices=["attention", "baseline"], default=config.DEFAULT_ARCHITECTURE)
-    parser.add_argument("--epochs", type=int, default=config.EPOCHS)
-    parser.add_argument("--batch_size", type=int, default=config.BATCH_SIZE)
-    parser.add_argument("--lr", type=float, default=config.LEARNING_RATE)
-    parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--no_glove", action="store_true")
-    parser.add_argument("--workers", type=int, default=4)
+    parser = argparse.ArgumentParser(description="Run a controlled CaptionLab experiment")
+    parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
+    parser.add_argument("--feature_cache", default=config.FEATURE_CACHE_PATH)
+    parser.add_argument("--runs_dir", default=DEFAULT_RUNS_DIR)
+    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--rebuild_vocab", action="store_true")
     parser.add_argument(
-        "--cached_features",
+        "--smoke",
         action="store_true",
-        help="Train from the shared frozen ResNet feature cache",
+        help="Run one epoch with two train/validation batches in a separate run directory",
     )
     parser.add_argument(
-        "--coverage_lambda",
-        type=float,
-        default=config.ATTENTION_REGULARIZATION,
-        help="Coverage coefficient; zero is the default attention ablation",
+        "--overwrite_smoke",
+        action="store_true",
+        help="Allow replacing only the disposable smoke-run directory",
     )
     return parser.parse_args()
-
-
-def save_checkpoint(state: dict, path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(state, path)
 
 
 def build_vocabulary(
@@ -112,88 +122,24 @@ def vocabulary_diagnostics(
     }
 
 
-def build_model(
-    architecture: str,
-    vocab: Vocabulary,
-    glove_matrix: np.ndarray | None,
-    *,
-    dropout: float = config.DROPOUT,
-    pretrained_encoder: bool = True,
-):
+def build_model(experiment: ExperimentConfig, vocab: Vocabulary):
     common = dict(
         vocab_size=len(vocab),
-        embed_dim=config.EMBED_DIM,
-        hidden_dim=config.HIDDEN_DIM,
-        dropout=dropout,
-        glove_matrix=glove_matrix,
+        embed_dim=experiment.embedding_dim,
+        hidden_dim=experiment.hidden_dim,
+        dropout=experiment.dropout,
+        glove_matrix=None,
         pad_idx=vocab[config.PAD_TOKEN],
         fine_tune_cnn=False,
-        pretrained_encoder=pretrained_encoder,
+        pretrained_encoder=False,
     )
-    if architecture == "attention":
+    if experiment.architecture == "attention":
         return ExplainableCaptioningModel(
             **common,
-            encoder_dim=config.ATTENTION_ENCODER_DIM,
-            attention_dim=config.ATTENTION_DIM,
+            encoder_dim=experiment.attention_encoder_dim,
+            attention_dim=experiment.attention_dim,
         )
-    return ImageCaptioningModel(**common, num_layers=config.NUM_LAYERS)
-
-
-def build_optimizer(model, lr: float, cnn_fine_tuned: bool) -> optim.Optimizer:
-    if cnn_fine_tuned:
-        return optim.Adam(
-            model.parameter_groups(lr, config.CNN_LR_FACTOR),
-            weight_decay=config.WEIGHT_DECAY,
-        )
-    return optim.Adam(
-        model.trainable_parameters(),
-        lr=lr,
-        weight_decay=config.WEIGHT_DECAY,
-    )
-
-
-def checkpoint_payload(
-    model,
-    optimizer,
-    epoch: int,
-    val_loss: float,
-    architecture: str,
-    vocab: Vocabulary,
-    *,
-    cnn_fine_tuned: bool,
-) -> dict:
-    return {
-        "epoch": epoch,
-        "model_state": model.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
-        "val_loss": val_loss,
-        "vocab_size": len(vocab),
-        "architecture": architecture,
-        "cnn_fine_tuned": cnn_fine_tuned,
-        "model_config": {
-            "embed_dim": config.EMBED_DIM,
-            "hidden_dim": config.HIDDEN_DIM,
-            "attention_encoder_dim": config.ATTENTION_ENCODER_DIM,
-            "attention_dim": config.ATTENTION_DIM,
-        },
-    }
-
-
-def inspect_checkpoint(path: str, expected_architecture: str) -> dict:
-    checkpoint = torch.load(path, map_location=config.DEVICE)
-    architecture = checkpoint.get("architecture", "baseline")
-    if architecture != expected_architecture:
-        raise ValueError(
-            f"Checkpoint architecture is {architecture!r}, but --architecture is "
-            f"{expected_architecture!r}. Use the matching architecture."
-        )
-    return checkpoint
-
-
-def restore_checkpoint(checkpoint: dict, model, optimizer: optim.Optimizer) -> tuple[int, float]:
-    model.load_state_dict(checkpoint["model_state"])
-    optimizer.load_state_dict(checkpoint["optimizer_state"])
-    return int(checkpoint["epoch"]) + 1, float(checkpoint["val_loss"])
+    return ImageCaptioningModel(**common, num_layers=1)
 
 
 def run_epoch(
@@ -203,218 +149,262 @@ def run_epoch(
     optimizer: optim.Optimizer | None,
     pad_idx: int,
     device: torch.device,
-    architecture: str,
+    experiment: ExperimentConfig,
     split: str,
     *,
-    cached_features: bool = False,
-    coverage_lambda: float = config.ATTENTION_REGULARIZATION,
-) -> tuple[float, float]:
-    """Return token-normalized total loss and attention regularization."""
+    max_batches: int | None = None,
+) -> dict[str, float]:
+    """Return separately observable caption, coverage, and total losses."""
     is_train = optimizer is not None
     model.train(is_train)
-    total_loss = 0.0
-    total_tokens = 0
-    total_attention = 0.0
-    batches = 0
+    totals = {"caption": 0.0, "total": 0.0, "tokens": 0, "coverage": 0.0, "batches": 0}
 
     with tqdm(loader, desc=split, leave=False, unit="batch") as bar:
-        for images, captions, _ in bar:
-            images = images.to(device, non_blocking=True)
+        for batch_index, (features, captions, _) in enumerate(bar):
+            if max_batches is not None and batch_index >= max_batches:
+                break
+            features = features.to(device, non_blocking=True)
             captions = captions.to(device, non_blocking=True)
             targets = captions[:, 1:].contiguous()
             valid_steps = targets != pad_idx
 
             with torch.set_grad_enabled(is_train):
-                output = (
-                    model.forward_from_features(images, captions)
-                    if cached_features
-                    else model(images, captions)
-                )
-                if architecture == "attention":
+                output = model.forward_from_features(features, captions)
+                if experiment.architecture == "attention":
                     logits, alphas = output
-                    attn_loss = attention_coverage_loss(alphas, valid_steps)
+                    coverage_loss = attention_coverage_loss(alphas, valid_steps)
                 else:
                     logits = output
-                    attn_loss = logits.new_tensor(0.0)
-
+                    coverage_loss = logits.new_tensor(0.0)
                 batch, steps, vocab_size = logits.shape
-                token_loss = criterion(
+                caption_loss = criterion(
                     logits.reshape(batch * steps, vocab_size),
                     targets.reshape(batch * steps),
                 )
-                loss = token_loss + coverage_lambda * attn_loss
+                total_loss = caption_loss + experiment.coverage_lambda * coverage_loss
 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), config.CLIP_GRAD_NORM)
+                total_loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), experiment.clip_grad_norm)
                 optimizer.step()
 
             non_pad = int(valid_steps.sum().item())
-            total_loss += float(loss.item()) * non_pad
-            total_tokens += non_pad
-            total_attention += float(attn_loss.item())
-            batches += 1
-            bar.set_postfix(loss=f"{loss.item():.4f}")
+            totals["caption"] += float(caption_loss.item()) * non_pad
+            totals["total"] += float(total_loss.item()) * non_pad
+            totals["tokens"] += non_pad
+            totals["coverage"] += float(coverage_loss.item())
+            totals["batches"] += 1
+            bar.set_postfix(caption=f"{caption_loss.item():.4f}", total=f"{total_loss.item():.4f}")
 
-    return total_loss / max(total_tokens, 1), total_attention / max(batches, 1)
+    return {
+        "caption_loss": totals["caption"] / max(totals["tokens"], 1),
+        "coverage_loss": totals["coverage"] / max(totals["batches"], 1),
+        "total_loss": totals["total"] / max(totals["tokens"], 1),
+    }
 
 
-def train(args: argparse.Namespace) -> None:
-    if args.coverage_lambda < 0:
-        raise ValueError("--coverage_lambda must be non-negative")
-    if args.architecture == "baseline" and args.coverage_lambda != 0:
-        raise ValueError("coverage regularization applies only to the attention model")
-    seed_everything()
+def _checkpoint_payload(
+    model,
+    optimizer: optim.Optimizer,
+    experiment: ExperimentConfig,
+    epoch: int,
+    best_val_caption_loss: float,
+    stale_epochs: int,
+    history: list[dict],
+    identities: dict[str, str],
+) -> dict:
+    return {
+        "checkpoint_version": 1,
+        "epoch": epoch,
+        "model_state": trainable_model_state(model),
+        "optimizer_state": optimizer.state_dict(),
+        "best_val_caption_loss": best_val_caption_loss,
+        "stale_epochs": stale_epochs,
+        "history": history,
+        "architecture": experiment.architecture,
+        "experiment": experiment.to_dict(),
+        "experiment_fingerprint": experiment.fingerprint,
+        "identities": identities,
+        "vocab_size": model.decoder.vocab_size,
+        "frozen_backbone_excluded": True,
+    }
+
+
+def _restore_checkpoint(
+    path: Path,
+    model,
+    optimizer: optim.Optimizer,
+    experiment: ExperimentConfig,
+    identities: dict[str, str],
+) -> tuple[int, float, int, list[dict]]:
+    checkpoint = torch.load(path, map_location=config.DEVICE, weights_only=False)
+    if checkpoint.get("experiment_fingerprint") != experiment.fingerprint:
+        raise RuntimeError("Resume checkpoint uses a different experiment configuration")
+    if checkpoint.get("identities") != identities:
+        raise RuntimeError("Resume checkpoint uses a different split, vocabulary, or feature cache")
+    load_trainable_model_state(model, checkpoint["model_state"])
+    optimizer.load_state_dict(checkpoint["optimizer_state"])
+    return (
+        int(checkpoint["epoch"]) + 1,
+        float(checkpoint["best_val_caption_loss"]),
+        int(checkpoint["stale_epochs"]),
+        list(checkpoint["history"]),
+    )
+
+
+def _provenance(
+    experiment: ExperimentConfig,
+    identities: dict[str, str],
+    diagnostics: dict[str, float | int],
+) -> dict:
+    device_name = (
+        torch.cuda.get_device_name(0)
+        if config.DEVICE.type == "cuda"
+        else platform.processor() or "CPU"
+    )
+    return {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "git_commit": git_revision(),
+        "command": sys.argv,
+        "python": platform.python_version(),
+        "pytorch": torch.__version__,
+        "device": str(config.DEVICE),
+        "device_name": device_name,
+        "experiment_fingerprint": experiment.fingerprint,
+        "identities": identities,
+        "data_diagnostics": diagnostics,
+        "declared_constraints": {
+            "encoder": "frozen torchvision ResNet50 IMAGENET1K_V1",
+            "visual_input": "shared cached 7x7 spatial feature grid",
+            "glove": False,
+            "label_smoothing": experiment.label_smoothing,
+        },
+    }
+
+
+def train(args: argparse.Namespace) -> Path:
+    experiment = ExperimentConfig.load(args.experiment)
+    if experiment.seed != config.SEED:
+        raise ValueError("Experiment seed must match the frozen split seed")
+    if args.smoke:
+        experiment = ExperimentConfig.from_dict(
+            {**experiment.to_dict(), "run_name": f"{experiment.run_name}_smoke", "epochs": 1}
+        )
+    if args.overwrite_smoke and not args.smoke:
+        raise ValueError("--overwrite_smoke is accepted only together with --smoke")
+
+    seed_everything(experiment.seed)
     image_captions = parse_captions()
     split_manifest = resolve_dataset_split(image_captions)
     vocab = build_vocabulary(image_captions, split_manifest, rebuild=args.rebuild_vocab)
-    print(json.dumps({"data_protocol": vocabulary_diagnostics(vocab, image_captions, split_manifest)}))
-    pad_idx = vocab[config.PAD_TOKEN]
-
-    glove_matrix = None
-    if config.USE_GLOVE and not args.no_glove and os.path.exists(config.GLOVE_FILE):
-        glove_matrix = vocab.build_glove_matrix()
-
-    loader_factory = (
-        build_cached_feature_dataloaders if args.cached_features else build_dataloaders
-    )
-    train_loader, val_loader, _, _ = loader_factory(
-        vocab, batch_size=args.batch_size, num_workers=args.workers
-    )
-
-    model = build_model(
-        args.architecture,
+    diagnostics = vocabulary_diagnostics(vocab, image_captions, split_manifest)
+    train_loader, val_loader, _, _ = build_cached_feature_dataloaders(
         vocab,
-        glove_matrix,
-        pretrained_encoder=not args.cached_features,
-    ).to(config.DEVICE)
-    criterion = nn.CrossEntropyLoss(ignore_index=pad_idx, label_smoothing=0.1)
+        args.feature_cache,
+        batch_size=experiment.batch_size,
+        num_workers=args.workers,
+    )
+    cache_metadata = train_loader.dataset.cache_metadata
+    identities = {
+        "split_fingerprint": split_manifest["split_fingerprint"],
+        "vocabulary_fingerprint": stable_hash(vocab.word2idx),
+        "feature_cache_fingerprint": stable_hash(cache_metadata),
+    }
 
-    start_epoch = 1
-    best_val_loss = math.inf
-    resumed_checkpoint = None
-    cnn_fine_tuned = False
+    run_dir = prepare_run_directory(
+        args.runs_dir,
+        experiment.run_name,
+        resume=args.resume,
+        overwrite=args.overwrite_smoke,
+    )
+    atomic_write_json(run_dir / "config.json", experiment.to_dict())
+    if not args.resume:
+        atomic_write_json(run_dir / "provenance.json", _provenance(experiment, identities, diagnostics))
 
+    model = build_model(experiment, vocab).to(config.DEVICE)
+    criterion = nn.CrossEntropyLoss(
+        ignore_index=vocab[config.PAD_TOKEN],
+        label_smoothing=experiment.label_smoothing,
+    )
+    optimizer = optim.Adam(
+        model.trainable_parameters(),
+        lr=experiment.learning_rate,
+        weight_decay=experiment.weight_decay,
+    )
+    start_epoch, best_loss, stale_epochs, history = 1, math.inf, 0, []
     if args.resume:
-        resumed_checkpoint = inspect_checkpoint(args.resume, args.architecture)
-        checkpoint_epoch = int(resumed_checkpoint["epoch"])
-        # New checkpoints store the stage explicitly; old checkpoints infer it
-        # from the epoch so resumes remain backwards compatible.
-        cnn_fine_tuned = bool(
-            resumed_checkpoint.get(
-                "cnn_fine_tuned",
-                checkpoint_epoch > config.FREEZE_CNN_EPOCHS,
-            )
+        start_epoch, best_loss, stale_epochs, history = _restore_checkpoint(
+            run_dir / "checkpoints" / "last.pt",
+            model,
+            optimizer,
+            experiment,
+            identities,
         )
-        model.set_cnn_fine_tune(cnn_fine_tuned)
-
-    optimizer = build_optimizer(model, args.lr, cnn_fine_tuned)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=2,
+    atomic_write_json(
+        run_dir / "status.json",
+        {"state": "running", "last_completed_epoch": start_epoch - 1},
     )
 
-    if resumed_checkpoint is not None:
-        start_epoch, best_val_loss = restore_checkpoint(
-            resumed_checkpoint,
-            model,
-            optimizer,
-        )
-
-    history: list[dict] = []
-    for epoch in range(start_epoch, args.epochs + 1):
-        started = time.time()
-
-        if (
-            not args.cached_features
-            and not cnn_fine_tuned
-            and epoch == config.FREEZE_CNN_EPOCHS + 1
-        ):
-            cnn_fine_tuned = True
-            model.set_cnn_fine_tune(True)
-            optimizer = build_optimizer(model, args.lr, cnn_fine_tuned=True)
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode="min",
-                factor=0.5,
-                patience=2,
+    max_batches = 2 if args.smoke else None
+    try:
+        for epoch in range(start_epoch, experiment.epochs + 1):
+            started = time.time()
+            train_metrics = run_epoch(
+                model, train_loader, criterion, optimizer, vocab[config.PAD_TOKEN],
+                config.DEVICE, experiment, "train", max_batches=max_batches,
             )
-
-        train_loss, train_attn = run_epoch(
-            model,
-            train_loader,
-            criterion,
-            optimizer,
-            pad_idx,
-            config.DEVICE,
-            args.architecture,
-            "train",
-            cached_features=args.cached_features,
-            coverage_lambda=args.coverage_lambda,
-        )
-        val_loss, val_attn = run_epoch(
-            model,
-            val_loader,
-            criterion,
-            None,
-            pad_idx,
-            config.DEVICE,
-            args.architecture,
-            "val",
-            cached_features=args.cached_features,
-            coverage_lambda=args.coverage_lambda,
-        )
-        scheduler.step(val_loss)
-
-        record = {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "train_attention_regularizer": train_attn,
-            "val_attention_regularizer": val_attn,
-            "cnn_fine_tuned": cnn_fine_tuned,
-            "coverage_lambda": args.coverage_lambda,
-            "cached_features": args.cached_features,
-            "seconds": round(time.time() - started, 2),
-        }
-        history.append(record)
-        print(json.dumps(record))
-
-        payload = checkpoint_payload(
-            model,
-            optimizer,
-            epoch,
-            val_loss,
-            args.architecture,
-            vocab,
-            cnn_fine_tuned=cnn_fine_tuned,
-        )
-        if epoch % config.SAVE_EVERY_N_EPOCHS == 0:
-            save_checkpoint(
-                payload,
-                os.path.join(config.MODELS_DIR, f"{args.architecture}_epoch_{epoch}.pth"),
+            val_metrics = run_epoch(
+                model, val_loader, criterion, None, vocab[config.PAD_TOKEN],
+                config.DEVICE, experiment, "validation", max_batches=max_batches,
             )
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            save_checkpoint(payload, config.BEST_MODEL_PATH)
+            improved = val_metrics["caption_loss"] < best_loss
+            if improved:
+                best_loss = val_metrics["caption_loss"]
+                stale_epochs = 0
+            else:
+                stale_epochs += 1
+            record = {
+                "epoch": epoch,
+                "train": train_metrics,
+                "validation": val_metrics,
+                "best_val_caption_loss": best_loss,
+                "improved": improved,
+                "seconds": round(time.time() - started, 2),
+            }
+            history.append(record)
+            print(json.dumps(record))
+            payload = _checkpoint_payload(
+                model, optimizer, experiment, epoch, best_loss, stale_epochs, history, identities
+            )
+            atomic_torch_save(run_dir / "checkpoints" / "last.pt", payload)
+            if improved:
+                atomic_torch_save(run_dir / "checkpoints" / "best.pt", payload)
+            atomic_write_json(run_dir / "history.json", history)
+            atomic_write_json(
+                run_dir / "status.json", {"state": "running", "last_completed_epoch": epoch}
+            )
+            if stale_epochs >= experiment.early_stopping_patience:
+                break
+    except BaseException:
+        atomic_write_json(
+            run_dir / "status.json",
+            {"state": "interrupted", "last_completed_epoch": history[-1]["epoch"] if history else 0},
+        )
+        raise
 
-    summary = {
-        "architecture": args.architecture,
-        "epochs": args.epochs,
-        "best_val_loss": best_val_loss,
-        "history": history,
-    }
-    os.makedirs(config.OUTPUTS_DIR, exist_ok=True)
-    with open(
-        os.path.join(config.OUTPUTS_DIR, "training_summary.json"),
-        "w",
-        encoding="utf-8",
-    ) as handle:
-        json.dump(summary, handle, indent=2)
+    atomic_write_json(
+        run_dir / "status.json",
+        {
+            "state": "completed",
+            "last_completed_epoch": history[-1]["epoch"] if history else 0,
+            "best_val_caption_loss": best_loss,
+            "stopped_early": len(history) < experiment.epochs,
+        },
+    )
+    return run_dir
 
 
 if __name__ == "__main__":
-    train(parse_args())
+    completed_dir = train(parse_args())
+    print(f"Artifacts written to {completed_dir}")
