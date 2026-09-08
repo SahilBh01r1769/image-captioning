@@ -197,76 +197,39 @@ The split is deterministic using the configured random seed. Because this reposi
 
 ---
 
-## Optional GloVe initialization
-
-Place:
-
-```text
-data/glove/glove.6B.200d.txt
-```
-
-The vocabulary loader reads only vectors required by the current vocabulary rather than holding the entire embedding file in memory. If the external GloVe dimensionality differs from the decoder embedding size, a deterministic projection initializes the caption embedding table.
-
-Training can also run without GloVe:
-
-```bash
-python train.py --no_glove
-```
-
----
-
 ## Train
 
-For the controlled, compute-efficient comparison, extract the frozen ResNet50 grid once:
+The controlled experiment intentionally uses learned word embeddings rather than GloVe. This keeps the baseline, attention, and coverage runs focused on the decoder change under the same training conditions.
+
+For the compute-efficient comparison, extract the frozen ResNet50 grid once:
 
 ```bash
 python extract_features.py
 ```
 
-Both ablations then train from that same cache. The baseline globally averages it; the attention decoder retains its spatial locations:
+Run the three versioned configurations from the same cache. The baseline globally averages it; the attention decoders retain its spatial locations:
 
 ```bash
-python train.py --architecture baseline --cached_features --no_glove
-python train.py --architecture attention --cached_features --no_glove
+python train.py --experiment experiments/baseline.json
+python train.py --experiment experiments/attention.json
+python train.py --experiment experiments/attention_coverage.json
 ```
 
-Coverage is enabled only for its own ablation by supplying a deliberately selected coefficient:
+Each run receives an isolated directory containing its exact configuration, provenance, history, best checkpoint, last checkpoint, and status. Existing full runs are never overwritten.
+
+If a run is interrupted, resume it using the same configuration:
 
 ```bash
-python train.py --architecture attention --cached_features --no_glove --coverage_lambda <chosen-value>
-```
-
-### Attention model — primary research path
-
-```bash
-python train.py --architecture attention
+python train.py --experiment experiments/attention.json --resume
 ```
 
 If an older cached vocabulary predates the frozen data protocol, training stops instead of silently reusing it. Rebuild it deliberately after reviewing the split:
 
 ```bash
-python train.py --architecture attention --rebuild_vocab
+python train.py --experiment experiments/baseline.json --rebuild_vocab
 ```
 
-### Global-vector baseline
-
-```bash
-python train.py --architecture baseline
-```
-
-### Custom run
-
-```bash
-python train.py --architecture attention --epochs 20 --batch_size 32 --lr 3e-4
-```
-
-### Resume
-
-```bash
-python train.py --architecture attention --resume models/attention_epoch_10.pth
-```
-
-Checkpoints store their architecture identifier, so inference/evaluation can reconstruct the correct model automatically.
+For limited hardware, use the restart-safe [`notebooks/CaptionLab_Colab.ipynb`](notebooks/CaptionLab_Colab.ipynb) workflow and follow [`COLAB_RUNBOOK.md`](COLAB_RUNBOOK.md). The notebook persists small artifacts to Drive and keeps the approximately 1.6 GB feature cache in temporary Colab storage.
 
 ---
 
