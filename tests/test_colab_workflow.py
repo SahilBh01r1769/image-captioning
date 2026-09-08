@@ -38,3 +38,13 @@ def test_colab_notebook_covers_all_controlled_runs_and_restart_paths():
     assert "--smoke" in source
     assert "--overwrite_smoke" in source
     assert "CaptionLab_training_bundle.zip" in source
+
+
+def test_colab_downloads_public_dataset_and_avoids_repeat_image_download():
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in _load_notebook()["cells"]
+    )
+
+    assert "kagglehub.dataset_download('adityajn105/flickr8k')" in source
+    assert "CAPTIONS_BACKUP" in source
+    assert "DRIVE_CACHE.exists() and CAPTIONS_BACKUP.is_file()" in source
