@@ -229,7 +229,7 @@ If an older cached vocabulary predates the frozen data protocol, training stops 
 python train.py --experiment experiments/baseline.json --rebuild_vocab
 ```
 
-For limited hardware, use the restart-safe [`notebooks/CaptionLab_Colab.ipynb`](notebooks/CaptionLab_Colab.ipynb) workflow and follow [`COLAB_RUNBOOK.md`](COLAB_RUNBOOK.md). The notebook persists small artifacts to Drive and keeps the approximately 1.6 GB feature cache in temporary Colab storage.
+For limited hardware, use the restart-safe [`notebooks/CaptionLab_Colab.ipynb`](notebooks/CaptionLab_Colab.ipynb) workflow and follow [`COLAB_RUNBOOK.md`](COLAB_RUNBOOK.md). It downloads Flickr8k directly in Colab, persists the feature cache and small experiment artifacts to Drive, and does not route the dataset through the user's computer.
 
 ---
 
