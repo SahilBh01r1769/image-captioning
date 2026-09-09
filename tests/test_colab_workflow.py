@@ -58,7 +58,7 @@ def test_evaluation_notebook_is_valid_pinned_and_marks_smoke_outputs():
     )
     assert "ed94547cfa1d60baf91c1e76d7687952276541fc" in source
     assert "--max_images','3'" in source
-    assert "--skip_metrics" in source
+    assert "partial_smoke_only" in source
     assert "--images_dir" in source
     assert "CaptionLab_evaluation_bundle" in source
     assert "num_beams" not in source

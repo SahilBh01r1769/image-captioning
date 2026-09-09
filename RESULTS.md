@@ -36,8 +36,8 @@ The vocabulary was built from training captions only. Held-out unknown-token rat
 
 These fields remain blank until the complete evaluation artifact is returned. Do not fill them from a smoke run, README example, third-party checkpoint, or a selected subset.
 
-| Run | BLEU-1 | BLEU-2 | BLEU-3 | BLEU-4 | ROUGE-L | CIDEr |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Run | BLEU-1 | BLEU-2 | BLEU-3 | BLEU-4 | METEOR | ROUGE-L | CIDEr |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Baseline | — | — | — | — | — | — | — |
 | Attention | — | — | — | — | — | — | — |
 | Attention + coverage | — | — | — | — | — | — | — |

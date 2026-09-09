@@ -43,7 +43,7 @@ def coco_payload(
 
 
 def compute_coco_metrics(predictions: list[dict]) -> dict[str, float]:
-    """Compute standard caption metrics with pinned established libraries.
+    """Compute standard caption metrics using pycocoevalcap 1.2.
 
     SPICE is intentionally excluded because its first run downloads external
     Stanford CoreNLP assets. BLEU-1..4, METEOR, ROUGE-L, and CIDEr are enough
@@ -52,12 +52,14 @@ def compute_coco_metrics(predictions: list[dict]) -> dict[str, float]:
     verify_metric_dependency()
     from pycocoevalcap.bleu.bleu import Bleu
     from pycocoevalcap.cider.cider import Cider
+    from pycocoevalcap.meteor.meteor import Meteor
     from pycocoevalcap.rouge.rouge import Rouge
 
     references, hypotheses = coco_payload(predictions)
     metrics: dict[str, float] = {}
     scorers = [
         (Bleu(4), ("BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4")),
+        (Meteor(), ("METEOR",)),
         (Rouge(), ("ROUGE-L",)),
         (Cider(), ("CIDEr",)),
     ]
