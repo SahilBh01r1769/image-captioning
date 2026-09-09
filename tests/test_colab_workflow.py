@@ -56,7 +56,7 @@ def test_evaluation_notebook_is_valid_pinned_and_marks_smoke_outputs():
     source = "\n".join(
         "".join(cell.get("source", [])) for cell in notebook["cells"]
     )
-    assert "417766fde1123c3c09a361d1d9092fd01a3c9415" in source
+    assert "ed94547cfa1d60baf91c1e76d7687952276541fc" in source
     assert "--max_images','3'" in source
     assert "partial_smoke_only" in source
     assert "--images_dir" in source
