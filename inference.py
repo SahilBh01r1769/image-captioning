@@ -17,6 +17,7 @@ import torchvision.transforms as T
 import config
 from attention_model import ExplainableCaptioningModel
 from model import ImageCaptioningModel
+from run_artifacts import load_trainable_model_state
 from vocabulary import Vocabulary
 
 
@@ -29,9 +30,9 @@ _INFER_TRANSFORM = T.Compose([
 
 
 @dataclass
-class TokenEvidence:
+class GeneratedToken:
     word: str
-    confidence: float
+    probability: float
     attention: list[float] = field(default_factory=list)
 
 
@@ -39,7 +40,7 @@ class TokenEvidence:
 class CaptionResult:
     caption: str
     score: float
-    tokens: list[TokenEvidence] = field(default_factory=list)
+    tokens: list[GeneratedToken] = field(default_factory=list)
 
 
 def preprocess_image(image: Image.Image, device: torch.device) -> torch.Tensor:
@@ -52,10 +53,11 @@ def load_image(path: str, device: torch.device) -> torch.Tensor:
 
 def _build_model_for_checkpoint(checkpoint: dict, vocab: Vocabulary, device: torch.device):
     architecture = checkpoint.get("architecture", "baseline")
+    experiment = checkpoint.get("experiment", {})
     common = dict(
         vocab_size=len(vocab),
-        embed_dim=config.EMBED_DIM,
-        hidden_dim=config.HIDDEN_DIM,
+        embed_dim=experiment.get("embedding_dim", config.EMBED_DIM),
+        hidden_dim=experiment.get("hidden_dim", config.HIDDEN_DIM),
         dropout=0.0,
         pad_idx=vocab[config.PAD_TOKEN],
         fine_tune_cnn=False,
@@ -66,14 +68,16 @@ def _build_model_for_checkpoint(checkpoint: dict, vocab: Vocabulary, device: tor
     if architecture == "attention":
         model = ExplainableCaptioningModel(
             **common,
-            encoder_dim=config.ATTENTION_ENCODER_DIM,
-            attention_dim=config.ATTENTION_DIM,
+            encoder_dim=experiment.get("attention_encoder_dim", config.ATTENTION_ENCODER_DIM),
+            attention_dim=experiment.get("attention_dim", config.ATTENTION_DIM),
         )
     elif architecture == "baseline":
         model = ImageCaptioningModel(**common, num_layers=config.NUM_LAYERS)
     else:
         raise ValueError(f"Unsupported checkpoint architecture: {architecture}")
-    model.load_state_dict(checkpoint["model_state"])
+    if checkpoint.get("vocab_size") not in (None, len(vocab)):
+        raise RuntimeError("Checkpoint vocabulary size does not match the loaded vocabulary")
+    load_trainable_model_state(model, checkpoint["model_state"])
     model.to(device).eval()
     return model, architecture
 
@@ -92,14 +96,25 @@ def baseline_greedy_decode(
     vocab: Vocabulary,
     max_len: int = config.MAX_GEN_LEN,
 ) -> CaptionResult:
-    device = img_tensor.device
+    return baseline_greedy_decode_features(model, model.encoder.feature_extractor(img_tensor), vocab, max_len)
+
+
+@torch.no_grad()
+def baseline_greedy_decode_features(
+    model: ImageCaptioningModel,
+    spatial_features: torch.Tensor,
+    vocab: Vocabulary,
+    max_len: int = config.MAX_GEN_LEN,
+) -> CaptionResult:
+    """Greedily decode one caption from the shared frozen spatial features."""
+    device = spatial_features.device
     start_idx = vocab[config.START_TOKEN]
     end_idx = vocab[config.END_TOKEN]
     pad_idx = vocab[config.PAD_TOKEN]
-    img_feat = model.encode(img_tensor)
+    img_feat = model.encode_features(spatial_features)
     hidden, cell = model.decoder._init_lstm_state(img_feat)
     token = torch.tensor([[start_idx]], device=device)
-    evidence: list[TokenEvidence] = []
+    generated: list[GeneratedToken] = []
     score = 0.0
 
     for _ in range(max_len):
@@ -107,18 +122,18 @@ def baseline_greedy_decode(
         output, (hidden, cell) = model.decoder.lstm(embedding, (hidden, cell))
         logits = model.decoder.classifier(output.squeeze(1))
         probs = F.softmax(logits, dim=-1)
-        confidence, prediction = probs.max(dim=-1)
+        selected_probability, prediction = probs.max(dim=-1)
         idx = int(prediction.item())
         if idx == end_idx:
             break
         if idx != pad_idx:
             word = vocab.idx2word.get(idx, config.UNK_TOKEN)
-            prob = float(confidence.item())
-            evidence.append(TokenEvidence(word=word, confidence=prob))
+            prob = float(selected_probability.item())
+            generated.append(GeneratedToken(word=word, probability=prob))
             score += math.log(max(prob, 1e-12))
         token = prediction.unsqueeze(1)
 
-    return CaptionResult(caption=" ".join(item.word for item in evidence), score=score, tokens=evidence)
+    return CaptionResult(caption=" ".join(item.word for item in generated), score=score, tokens=generated)
 
 
 @torch.no_grad()
@@ -129,35 +144,49 @@ def attention_greedy_decode(
     max_len: int = config.MAX_GEN_LEN,
     temperature: float = config.DEFAULT_TEMPERATURE,
 ) -> CaptionResult:
+    return attention_greedy_decode_features(
+        model, model.encoder.feature_extractor(img_tensor), vocab, max_len, temperature
+    )
+
+
+@torch.no_grad()
+def attention_greedy_decode_features(
+    model: ExplainableCaptioningModel,
+    spatial_features: torch.Tensor,
+    vocab: Vocabulary,
+    max_len: int = config.MAX_GEN_LEN,
+    temperature: float = config.DEFAULT_TEMPERATURE,
+) -> CaptionResult:
+    """Greedily decode and retain attention weights from cached features."""
     if temperature <= 0:
         raise ValueError("temperature must be positive")
-    device = img_tensor.device
-    encoder_out = model.encode(img_tensor)
+    device = spatial_features.device
+    encoder_out = model.encode_features(spatial_features)
     state = model.decoder.init_state(encoder_out)
     token = torch.tensor([vocab[config.START_TOKEN]], device=device)
     end_idx = vocab[config.END_TOKEN]
     pad_idx = vocab[config.PAD_TOKEN]
-    evidence: list[TokenEvidence] = []
+    generated: list[GeneratedToken] = []
     score = 0.0
 
     for _ in range(max_len):
         logits, state, alpha = model.decoder.step(token, encoder_out, state)
         probs = F.softmax(logits / temperature, dim=-1)
-        confidence, prediction = probs.max(dim=-1)
+        selected_probability, prediction = probs.max(dim=-1)
         idx = int(prediction.item())
         if idx == end_idx:
             break
         if idx != pad_idx:
-            prob = float(confidence.item())
-            evidence.append(TokenEvidence(
+            prob = float(selected_probability.item())
+            generated.append(GeneratedToken(
                 word=vocab.idx2word.get(idx, config.UNK_TOKEN),
-                confidence=prob,
+                probability=prob,
                 attention=alpha.squeeze(0).detach().cpu().tolist(),
             ))
             score += math.log(max(prob, 1e-12))
         token = prediction
 
-    return CaptionResult(caption=" ".join(item.word for item in evidence), score=score, tokens=evidence)
+    return CaptionResult(caption=" ".join(item.word for item in generated), score=score, tokens=generated)
 
 
 def _length_penalized(log_prob: float, length: int, alpha: float = 0.7) -> float:
@@ -194,9 +223,9 @@ def baseline_beam_search_decode(
                 new_ids = ids + [idx]
                 new_evidence = evidence
                 if idx not in (end_idx, pad_idx):
-                    new_evidence = evidence + [TokenEvidence(
+                    new_evidence = evidence + [GeneratedToken(
                         word=vocab.idx2word.get(idx, config.UNK_TOKEN),
-                        confidence=float(math.exp(lp)),
+                        probability=float(math.exp(lp)),
                     )]
                 if idx == end_idx or step == max_len - 1:
                     completed.append((new_log_prob, new_ids, new_evidence))
@@ -256,9 +285,9 @@ def attention_beam_search_decode(
                 new_ids = ids + [idx]
                 new_evidence = evidence
                 if idx not in (end_idx, pad_idx):
-                    new_evidence = evidence + [TokenEvidence(
+                    new_evidence = evidence + [GeneratedToken(
                         word=vocab.idx2word.get(idx, config.UNK_TOKEN),
-                        confidence=float(math.exp(lp)),
+                        probability=float(math.exp(lp)),
                         attention=attention,
                     )]
                 if idx == end_idx or step == max_len - 1:
@@ -303,7 +332,22 @@ def generate_captions(
     raise ValueError(f"Unsupported architecture: {architecture}")
 
 
-def attention_grid(token: TokenEvidence) -> Optional[np.ndarray]:
+def generate_caption_from_features(
+    model,
+    architecture: str,
+    spatial_features: torch.Tensor,
+    vocab: Vocabulary,
+    max_len: int = config.MAX_GEN_LEN,
+) -> CaptionResult:
+    """Official controlled-comparison decode: deterministic greedy search."""
+    if architecture == "baseline":
+        return baseline_greedy_decode_features(model, spatial_features, vocab, max_len)
+    if architecture == "attention":
+        return attention_greedy_decode_features(model, spatial_features, vocab, max_len, 1.0)
+    raise ValueError(f"Unsupported architecture: {architecture}")
+
+
+def attention_grid(token: GeneratedToken) -> Optional[np.ndarray]:
     if not token.attention:
         return None
     side = int(round(len(token.attention) ** 0.5))
@@ -336,8 +380,8 @@ def caption_path(path: str, model, architecture: str, vocab: Vocabulary, args: a
     for rank, result in enumerate(results[:3], 1):
         print(f"  {rank}. {result.caption}  (score={result.score:.3f})")
         if result.tokens:
-            mean_conf = sum(token.confidence for token in result.tokens) / len(result.tokens)
-            print(f"     mean token confidence={mean_conf:.1%}")
+            mean_probability = sum(token.probability for token in result.tokens) / len(result.tokens)
+            print(f"     mean selected-token probability={mean_probability:.1%}")
 
 
 def main() -> None:

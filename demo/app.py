@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import itertools
-import os
 from pathlib import Path
 import sys
 
@@ -18,7 +16,6 @@ import config
 from inference import attention_grid, generate_captions, load_model, preprocess_image
 from vocabulary import Vocabulary
 
-REFERENCE_MODEL_ID = "microsoft/git-base-coco"
 CUSTOM_MODEL_PATH = ROOT / "models" / "best_model.pth"
 CUSTOM_VOCAB_PATH = ROOT / "models" / "vocabulary.pkl"
 
@@ -61,7 +58,7 @@ hr{border-color:rgba(255,255,255,.08)!important;}
 </style>
 <div class="hero">
   <h1>CaptionLab · Explainable Image Captioning</h1>
-  <p>Turn an image into language, compare alternative captions, and—when the custom attention checkpoint is available—inspect which image region influenced each generated word.</p>
+  <p>Optional diagnostic viewer for a CaptionLab checkpoint. It is not the experiment, an online service, or a substitute for test-set evaluation.</p>
   <span class="pill">RESNET50 SPATIAL FEATURES</span>
   <span class="pill">ADDITIVE ATTENTION</span>
   <span class="pill">LSTM DECODER</span>
@@ -77,7 +74,7 @@ with objective:
 with method:
     st.markdown('<div class="step"><b>Method</b><p>Encode visual features, decode one word at a time, and keep multiple likely sequences through beam search.</p></div>', unsafe_allow_html=True)
 with result:
-    st.markdown('<div class="step"><b>Result</b><p>A ranked caption plus confidence/diversity signals; the custom model also exposes word-level spatial attention.</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="step"><b>Result</b><p>A generated caption and decoder attention weights. Selected-token probabilities are diagnostic values, not calibrated confidence.</p></div>', unsafe_allow_html=True)
 
 
 def custom_model_available() -> bool:
@@ -85,52 +82,10 @@ def custom_model_available() -> bool:
 
 
 @st.cache_resource(show_spinner=False)
-def load_reference_model():
-    from transformers import AutoModelForCausalLM, AutoProcessor
-
-    processor = AutoProcessor.from_pretrained(REFERENCE_MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(REFERENCE_MODEL_ID)
-    model.eval()
-    return processor, model
-
-
-@st.cache_resource(show_spinner=False)
 def load_custom_model():
     vocab = Vocabulary.load(str(CUSTOM_VOCAB_PATH))
     model, architecture = load_model(str(CUSTOM_MODEL_PATH), vocab, torch.device("cpu"))
     return vocab, model, architecture
-
-
-def reference_captions(image: Image.Image, beam_size: int, count: int) -> list[tuple[str, float | None]]:
-    processor, model = load_reference_model()
-    pixel_values = processor(images=image.convert("RGB"), return_tensors="pt").pixel_values
-    with torch.inference_mode():
-        output = model.generate(
-            pixel_values=pixel_values,
-            max_length=40,
-            num_beams=max(beam_size, count),
-            num_return_sequences=count,
-            early_stopping=True,
-            return_dict_in_generate=True,
-            output_scores=True,
-        )
-    captions = processor.batch_decode(output.sequences, skip_special_tokens=True)
-    sequence_scores = getattr(output, "sequences_scores", None)
-    scores = sequence_scores.detach().cpu().tolist() if sequence_scores is not None else [None] * len(captions)
-    return [(caption.strip(), score) for caption, score in zip(captions, scores)]
-
-
-def candidate_diversity(captions: list[str]) -> float:
-    pairs = list(itertools.combinations(captions, 2))
-    if not pairs:
-        return 0.0
-    values = []
-    for first, second in pairs:
-        a, b = set(first.lower().split()), set(second.lower().split())
-        union = a | b
-        similarity = len(a & b) / len(union) if union else 1.0
-        values.append(1.0 - similarity)
-    return float(sum(values) / len(values))
 
 
 def center_crop_224(image: Image.Image) -> Image.Image:
@@ -164,17 +119,13 @@ def attention_overlay(image: Image.Image, grid: np.ndarray) -> Image.Image:
 
 
 with st.sidebar:
-    st.header("Generation")
+    st.header("Checkpoint diagnostic")
     available = custom_model_available()
-    if available:
-        mode = st.radio("Model", ["Custom attention model", "Hosted reference model"])
-    else:
-        mode = "Hosted reference model"
-        st.caption("No custom checkpoint is bundled on this hosted branch, so the interactive demo uses the documented reference model.")
+    st.caption("Custom checkpoint found." if available else "No custom checkpoint is bundled. Add the trained checkpoint and vocabulary locally to use this viewer.")
     beam_size = st.slider("Beam width", 1, 8, 5, help="Higher values retain more candidate word sequences before selecting the best caption.")
     candidate_count = st.slider("Alternatives", 1, 3, 3)
     st.divider()
-    st.caption("The research code in this repository trains its own ResNet50 + additive-attention + LSTM architecture on Flickr8k. The hosted fallback is Microsoft GIT-base-coco and is not presented as that custom checkpoint.")
+    st.caption("Greedy decoding is used for the controlled comparison. Beam search here is secondary, qualitative analysis only.")
 
 st.markdown("### 1 · Give the model an image")
 st.caption("The model receives pixels only. The caption is generated autoregressively—one token conditioned on the image and previously generated words at a time.")
@@ -193,6 +144,9 @@ if uploaded is None:
     st.stop()
 
 image = Image.open(uploaded).convert("RGB")
+if not available:
+    st.error("Diagnostic viewer unavailable: models/best_model.pth and models/vocabulary.pkl are required.")
+    st.stop()
 left_image, right_context = st.columns([1.15, 1])
 with left_image:
     st.image(image, use_container_width=True)
@@ -203,7 +157,7 @@ with right_context:
 1. **Encode** visual information into deep feature representations.  
 2. **Decode** candidate words conditioned on the image and previous tokens.  
 3. **Search** multiple sequences instead of committing to the first local choice.  
-4. **Interpret** the winning caption using confidence/diversity signals—and spatial attention when the custom checkpoint is active.
+4. **Inspect** selected-token probabilities and spatial attention without treating either as proof of visual correctness.
 """
     )
 
@@ -211,67 +165,42 @@ if not st.button("Generate caption", type="primary", use_container_width=True):
     st.stop()
 
 st.markdown("### 2 · Read the result")
-if mode == "Custom attention model":
-    vocab, model, architecture = load_custom_model()
-    tensor = preprocess_image(image, torch.device("cpu"))
-    with st.spinner("Decoding with the custom checkpoint..."):
-        results = generate_captions(
-            model,
-            architecture,
-            tensor,
-            vocab,
-            beam_size=beam_size,
-        )[:candidate_count]
-    best = results[0]
-    mean_confidence = (
-        sum(token.confidence for token in best.tokens) / len(best.tokens)
-        if best.tokens else 0.0
-    )
-    st.markdown(
-        f'<div class="caption-card"><div class="muted">CUSTOM {architecture.upper()} · BEST CAPTION</div><div class="caption-main">{best.caption}</div><div class="muted">Mean generated-token confidence: {mean_confidence:.1%}</div></div>',
-        unsafe_allow_html=True,
-    )
+vocab, model, architecture = load_custom_model()
+tensor = preprocess_image(image, torch.device("cpu"))
+with st.spinner("Decoding with the custom checkpoint..."):
+    results = generate_captions(model, architecture, tensor, vocab, beam_size=beam_size)[:candidate_count]
+best = results[0]
+mean_probability = (
+    sum(token.probability for token in best.tokens) / len(best.tokens)
+    if best.tokens else 0.0
+)
+st.markdown(
+    f'<div class="caption-card"><div class="muted">CUSTOM {architecture.upper()} · BEST CAPTION</div><div class="caption-main">{best.caption}</div><div class="muted">Mean selected-token probability: {mean_probability:.1%}</div></div>',
+    unsafe_allow_html=True,
+)
 
-    if len(results) > 1:
-        st.markdown("#### Alternative beams")
-        for index, candidate in enumerate(results[1:], 2):
-            st.write(f"**{index}.** {candidate.caption}")
+if len(results) > 1:
+    st.markdown("#### Alternative beams")
+    for index, candidate in enumerate(results[1:], 2):
+        st.write(f"**{index}.** {candidate.caption}")
 
-    if architecture == "attention" and best.tokens:
-        st.markdown("### 3 · Where did it look?")
-        st.caption("Each panel overlays the attention weights used while producing that word. Bright regions indicate stronger decoder focus; they are explanatory model weights, not object-detection boxes.")
-        visible = [token for token in best.tokens if attention_grid(token) is not None][:9]
-        for offset in range(0, len(visible), 3):
-            columns = st.columns(3)
-            for column, token in zip(columns, visible[offset:offset + 3]):
-                grid = attention_grid(token)
-                with column:
-                    st.image(attention_overlay(image, grid), use_container_width=True)
-                    st.caption(f"**{token.word}** · token confidence {token.confidence:.0%}")
-else:
-    with st.spinner("Loading the hosted reference captioner and generating candidates..."):
-        candidates = reference_captions(image, beam_size, candidate_count)
-    captions = [caption for caption, _ in candidates]
-    best_caption, best_score = candidates[0]
-    diversity = candidate_diversity(captions)
-    score_text = f" · beam score {best_score:.3f}" if best_score is not None else ""
-    st.markdown(
-        f'<div class="caption-card"><div class="muted">HOSTED REFERENCE · MICROSOFT GIT-BASE-COCO</div><div class="caption-main">{best_caption}</div><div class="muted">Candidate lexical diversity: {diversity:.0%}{score_text}</div></div>',
-        unsafe_allow_html=True,
-    )
-    if len(candidates) > 1:
-        st.markdown("#### Alternative beams")
-        for index, (caption, score) in enumerate(candidates[1:], 2):
-            suffix = f"  ·  score {score:.3f}" if score is not None else ""
-            st.write(f"**{index}.** {caption}{suffix}")
-    st.info("This hosted result uses the MIT-licensed Microsoft GIT-base-coco checkpoint so the public demo is immediately interactive. The repository's custom attention architecture is separately trainable and automatically becomes the demo model when its checkpoint + vocabulary are present.")
+if architecture == "attention" and best.tokens:
+    st.markdown("### 3 · Where did it look?")
+    st.caption("Each panel overlays decoder attention weights. They show allocation inside the model, not causal evidence or object-detection boxes.")
+    visible = [token for token in best.tokens if attention_grid(token) is not None][:9]
+    for offset in range(0, len(visible), 3):
+        columns = st.columns(3)
+        for column, token in zip(columns, visible[offset:offset + 3]):
+            grid = attention_grid(token)
+            with column:
+                st.image(attention_overlay(image, grid), use_container_width=True)
+                st.caption(f"**{token.word}** · selected probability {token.probability:.0%}")
 
 with st.expander("How to interpret the numbers"):
     st.markdown(
         """
 - **Beam score** ranks alternative generated sequences; it is useful comparatively and should not be read as a calibrated probability.
-- **Candidate diversity** is lexical disagreement between returned beams. Higher diversity means the decoder found more substantially different descriptions.
-- **Token confidence** (custom checkpoint) is the softmax probability assigned to the selected word at that decoding step; it is not a guarantee that the word is visually correct.
+- **Selected-token probability** is the decoder softmax value for the chosen word. It is not calibrated confidence and does not establish visual correctness.
 - **Attention overlays** show where the custom decoder weighted spatial CNN features while generating a word. They help inspect reasoning behavior but do not prove causal explanation.
 """
     )
