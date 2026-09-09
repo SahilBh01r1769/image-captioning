@@ -6,7 +6,7 @@ import torch
 import config
 from attention_model import ExplainableCaptioningModel
 from coco_metrics import coco_payload
-from evaluate import prediction_record, write_failure_gallery_scaffold, write_jsonl
+from evaluate import evaluate_run, prediction_record, write_failure_gallery_scaffold, write_jsonl
 from inference import generate_caption_from_features
 from report_evaluation import _fixed_sample, comparison_markdown
 from vocabulary import Vocabulary
@@ -79,3 +79,14 @@ def test_comparison_table_uses_manifest_values_and_fixed_sampling_avoids_cherry_
 
     records = [{"image_name": f"{index}.jpg"} for index in range(10)]
     assert [row["image_name"] for row in _fixed_sample(records, 3)] == ["0.jpg", "4.jpg", "9.jpg"]
+
+
+def test_incomplete_training_run_cannot_be_evaluated(tmp_path):
+    run_dir = tmp_path / "baseline_seed42"
+    run_dir.mkdir()
+    (run_dir / "status.json").write_text('{"state":"interrupted"}')
+    with pytest.raises(RuntimeError, match="incomplete"):
+        evaluate_run(
+            "baseline_seed42", run_dir, tmp_path / "evaluation", {}, small_vocabulary(),
+            torch.empty(0), {}, {}, [],
+        )

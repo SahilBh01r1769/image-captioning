@@ -93,6 +93,12 @@ def evaluate_run(
     identities: dict[str, str],
     test_keys: list[str],
 ) -> dict:
+    status_path = run_dir / "status.json"
+    if not status_path.is_file():
+        raise FileNotFoundError(f"Run status is missing: {status_path}")
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    if status.get("state") != "completed":
+        raise RuntimeError(f"Refusing to evaluate incomplete run: {run_name}")
     checkpoint, model, architecture = load_verified_checkpoint(
         run_dir / "checkpoints" / "best.pt", vocab, identities
     )
