@@ -30,6 +30,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vocabulary", default=config.VOCAB_PATH)
     parser.add_argument("--output_dir", default="evaluation")
     parser.add_argument("--max_images", type=int, default=None, help="Smoke-only prefix; never report as a full result")
+    parser.add_argument(
+        "--skip_metrics", action="store_true",
+        help="Skip corpus metrics only for a partial smoke run",
+    )
     return parser.parse_args()
 
 
@@ -92,6 +96,8 @@ def evaluate_run(
     feature_index: dict[str, int],
     identities: dict[str, str],
     test_keys: list[str],
+    *,
+    compute_metrics: bool = True,
 ) -> dict:
     status_path = run_dir / "status.json"
     if not status_path.is_file():
@@ -110,10 +116,9 @@ def evaluate_run(
         result = generate_caption_from_features(model, architecture, spatial, vocab)
         records.append(prediction_record(image_name, image_captions[image_name], result))
     write_jsonl(output_dir / run_name / "predictions.jsonl", records)
-    metrics = {
-        **compute_coco_metrics(records),
-        **caption_statistics([record["prediction"] for record in records]),
-    }
+    metrics = caption_statistics([record["prediction"] for record in records])
+    if compute_metrics:
+        metrics = {**compute_coco_metrics(records), **metrics}
     summary = {
         "run_name": run_name,
         "architecture": architecture,
@@ -122,6 +127,7 @@ def evaluate_run(
         "images_evaluated": len(records),
         "decoding": {"method": "greedy", "temperature": 1.0},
         "metrics": metrics,
+        "corpus_metrics_computed": compute_metrics,
         "identities": identities,
     }
     atomic_write_json(output_dir / run_name / "summary.json", summary)
@@ -138,6 +144,8 @@ def write_failure_gallery_scaffold(path: Path) -> None:
 
 
 def evaluate(args: argparse.Namespace) -> dict:
+    if args.skip_metrics and args.max_images is None:
+        raise ValueError("--skip_metrics is allowed only with --max_images smoke evaluation")
     output_dir = Path(args.output_dir)
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"Evaluation output already exists: {output_dir}")
@@ -146,6 +154,7 @@ def evaluate(args: argparse.Namespace) -> dict:
         evaluate_run(
             name, Path(args.runs_dir) / name, output_dir, image_captions, vocab,
             features, feature_index, identities, test_keys,
+            compute_metrics=not args.skip_metrics,
         )
         for name in RUN_NAMES
     ]
@@ -157,7 +166,8 @@ def evaluate(args: argparse.Namespace) -> dict:
         "run_order": list(RUN_NAMES),
         "primary_decoding": "greedy",
         "metric_implementation": f"pycocoevalcap=={PYCOCOEVALCAP_VERSION}",
-        "metrics": ["BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4", "METEOR", "ROUGE-L", "CIDEr"],
+        "corpus_metrics_computed": not args.skip_metrics,
+        "metrics": ["BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4", "ROUGE-L", "CIDEr"],
         "identities": identities,
         "runs": summaries,
     }

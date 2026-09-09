@@ -1,4 +1,5 @@
 import json
+from argparse import Namespace
 
 import pytest
 import torch
@@ -6,7 +7,7 @@ import torch
 import config
 from attention_model import ExplainableCaptioningModel
 from coco_metrics import coco_payload
-from evaluate import evaluate_run, prediction_record, write_failure_gallery_scaffold, write_jsonl
+from evaluate import evaluate, evaluate_run, prediction_record, write_failure_gallery_scaffold, write_jsonl
 from inference import generate_caption_from_features
 from report_evaluation import _fixed_sample, comparison_markdown
 from vocabulary import Vocabulary
@@ -90,3 +91,9 @@ def test_incomplete_training_run_cannot_be_evaluated(tmp_path):
             "baseline_seed42", run_dir, tmp_path / "evaluation", {}, small_vocabulary(),
             torch.empty(0), {}, {}, [],
         )
+
+
+def test_metrics_can_be_skipped_only_for_explicit_smoke_run(tmp_path):
+    args = Namespace(skip_metrics=True, max_images=None, output_dir=str(tmp_path / "evaluation"))
+    with pytest.raises(ValueError, match="only with --max_images"):
+        evaluate(args)

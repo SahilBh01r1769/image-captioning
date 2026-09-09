@@ -44,7 +44,7 @@ Attention fit the training captions more strongly without improving validation c
 
 ## Evaluation protocol
 
-The primary comparison uses the best validation-loss checkpoint for each pre-registered run, greedy decoding at temperature 1.0, all 810 frozen test images, and all five references per image. Standard BLEU-1…4, METEOR, ROUGE-L, and CIDEr are computed with exactly `pycocoevalcap==1.2`. Beam search is secondary analysis only.
+The primary comparison uses the best validation-loss checkpoint for each pre-registered run, greedy decoding at temperature 1.0, all 810 frozen test images, and all five references per image. BLEU-1…4, ROUGE-L, and CIDEr use exactly `pycocoevalcap==1.2`. METEOR is intentionally not reported because its Java/WordNet dependencies stalled in Colab. Beam search is secondary analysis only.
 
 Every prediction, reference set, token probability, and attention vector is exported before aggregate reporting. Attention weights are decoder allocations, not causal explanations. Details are fixed in [EVALUATION_PROTOCOL.md](EVALUATION_PROTOCOL.md).
 

@@ -31,6 +31,11 @@ def comparison_markdown(manifest: dict) -> str:
             f"{metrics['distinct_1']:.4f}",
             f"{metrics['distinct_2']:.4f}",
         ])
+    implementation = manifest["metric_implementation"]
+    if isinstance(implementation, dict):
+        implementation = "; ".join(
+            f"{name}: {package}" for name, package in implementation.items()
+        )
     lines = [
         "# Generated controlled-comparison table",
         "",
@@ -40,7 +45,7 @@ def comparison_markdown(manifest: dict) -> str:
         "| " + " | ".join(["---"] + ["---:"] * (len(header) - 1)) + " |",
         *("| " + " | ".join(row) + " |" for row in rows),
         "",
-        f"Metric implementation: `{manifest['metric_implementation']}`. Values are emitted without rescaling.",
+        f"Metric implementation: `{implementation}`. Values are emitted without rescaling.",
         "",
     ]
     return "\n".join(lines)

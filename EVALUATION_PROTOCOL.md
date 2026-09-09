@@ -15,10 +15,9 @@ Beam search can be examined later, but it is not part of the primary architectur
 
 ## Metrics
 
-The evaluator checks for exactly `pycocoevalcap==1.2` and reports its outputs without multiplying by 100:
+The evaluator reports outputs without multiplying by 100. BLEU-1…4, ROUGE-L, and CIDEr use exactly `pycocoevalcap==1.2`. METEOR is intentionally excluded: its Java/WordNet dependencies stalled during a Colab smoke run, and an approximation would be misleading.
 
 - BLEU-1, BLEU-2, BLEU-3, BLEU-4
-- METEOR
 - ROUGE-L
 - CIDEr
 
