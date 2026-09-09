@@ -4,6 +4,7 @@ from pathlib import Path
 
 
 NOTEBOOK = Path(__file__).parents[1] / "notebooks" / "CaptionLab_Colab.ipynb"
+EVALUATION_NOTEBOOK = Path(__file__).parents[1] / "notebooks" / "CaptionLab_Evaluation.ipynb"
 PINNED_RUNNER_COMMIT = "95f78c8310027c32c80a430bc867e98ffa974328"
 
 
@@ -48,3 +49,19 @@ def test_colab_downloads_public_dataset_and_avoids_repeat_image_download():
     assert "kagglehub.dataset_download('adityajn105/flickr8k')" in source
     assert "CAPTIONS_BACKUP" in source
     assert "DRIVE_CACHE.exists() and CAPTIONS_BACKUP.is_file()" in source
+
+
+def test_evaluation_notebook_is_valid_pinned_and_marks_smoke_outputs():
+    notebook = json.loads(EVALUATION_NOTEBOOK.read_text(encoding="utf-8"))
+    source = "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
+    assert "417766fde1123c3c09a361d1d9092fd01a3c9415" in source
+    assert "--max_images','3'" in source
+    assert "partial_smoke_only" in source
+    assert "--images_dir" in source
+    assert "CaptionLab_evaluation_bundle" in source
+    assert "num_beams" not in source
+    for index, cell in enumerate(notebook["cells"]):
+        if cell.get("cell_type") == "code":
+            ast.parse("".join(cell.get("source", [])), filename=f"evaluation-cell-{index}")
