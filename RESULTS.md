@@ -1,62 +1,58 @@
-# Reproducible Results
+# Results and evidence status
 
-The current repository implements and tests the captioning architectures, training lifecycle, inference, metrics, and interactive demo. It does **not** commit a trained Flickr8k checkpoint, so this file intentionally does not publish an unverified BLEU/METEOR score.
+Last evidence review: 2026-09-09.
 
-## What is verified in CI
+## What has actually run
 
-The clean Python 3.11 workflow verifies, without downloading Flickr8k or ImageNet weights:
+Three controlled training runs completed for 20 epochs on a Colab Tesla T4 using PyTorch 2.11.0+cu128. The artifacts identify training-code commit `95f78c8310027c32c80a430bc867e98ffa974328` and the same split, vocabulary, and feature-cache fingerprints for every run. No run reports early stopping.
 
-- spatial encoder output retains multiple image locations,
-- additive-attention weights normalize across those locations,
-- the attention decoder returns correctly shaped token logits and spatial maps,
-- attention coverage regularization accepts a non-padding mask,
-- image-level train/validation/test splits are deterministic and disjoint,
-- vocabulary encode/decode behavior,
-- BLEU and METEOR-lite sanity checks,
-- caption-diversity bounds.
+| Run | Best validation caption loss | Best epoch | Final train caption loss | Final validation caption loss |
+| --- | ---: | ---: | ---: | ---: |
+| `baseline_seed42` | 2.838195 | 20 | 2.831761 | 2.838195 |
+| `attention_seed42` | 2.843421 | 19 | 2.512012 | 2.846521 |
+| `attention_coverage_seed42` | 2.819040 | 19 | 2.528234 | 2.819065 |
 
-A separate workflow installs the hosted-demo dependencies, compiles the captioning/demo modules, starts Streamlit, and checks the application health endpoint.
+Observed, without overclaiming:
 
-## How to create an actual model result
+- The baseline ended with almost no train/validation loss gap.
+- Plain attention reduced training loss substantially but did not improve its best validation caption loss over the baseline. This is consistent with mild overfitting, though one run cannot establish a general pattern.
+- Coverage reached a validation caption loss about 0.019 below the baseline. The difference is too small and the evidence too limited to claim better captioning before test evaluation.
+- Coverage loss rose from roughly 0.58 to 0.65; with coefficient 0.1 its contribution to total loss was roughly 0.06. Total loss is therefore not comparable across coverage and non-coverage runs.
 
-After obtaining Flickr8k, train a checkpoint:
+## Data diagnostics
 
-```bash
-python train.py --architecture attention
-```
+| Item | Verified value |
+| --- | ---: |
+| Training images | 6,472 |
+| Validation images | 809 |
+| Test images | 810 |
+| Vocabulary size | 2,662 |
+| Validation unknown-token rate | 3.09% |
+| Test unknown-token rate | 3.17% |
 
-Then evaluate the saved checkpoint:
+The vocabulary was built from training captions only. Held-out unknown-token rates are reported rather than eliminated through leakage.
 
-```bash
-python evaluate.py --model models/best_model.pth --beam_size 5
-```
+## Test comparison — pending
 
-The machine-readable output is written to:
+These fields remain blank until the complete evaluation artifact is returned. Do not fill them from a smoke run, README example, third-party checkpoint, or a selected subset.
 
-```text
-outputs/evaluation_results.json
-```
+| Run | BLEU-1 | BLEU-2 | BLEU-3 | BLEU-4 | METEOR | ROUGE-L | CIDEr |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline | — | — | — | — | — | — | — |
+| Attention | — | — | — | — | — | — | — |
+| Attention + coverage | — | — | — | — | — | — | — |
 
-A future verified result section should record at minimum:
+Required artifact: `CaptionLab_evaluation_bundle.zip` produced by `notebooks/CaptionLab_Evaluation.ipynb`. It must say `status: complete` and `images_evaluated_per_run: 810`.
 
-- exact checkpoint / commit,
-- architecture (`attention` or `baseline`),
-- split seed and split policy,
-- beam size,
-- images evaluated / failed,
-- BLEU-1 through BLEU-4,
-- METEOR-lite (clearly labelled as the repository approximation),
-- Distinct-1 / Distinct-2,
-- mean caption length,
-- training configuration.
+## Qualitative analysis — pending
 
-## Recommended ablation table
+No generated test captions or attention maps have been reviewed yet. The failure gallery is deliberately empty. After evaluation, it will include a fixed, traceable set of images and will discuss failures rather than only attractive examples.
 
-Once both models have been trained under the same protocol, this is the comparison worth reporting:
+## What cannot yet go on a resume
 
-| Architecture | Spatial attention | CNN fine-tuning | BLEU-4 | METEOR-lite | Distinct-2 |
-|---|---|---|---:|---:|---:|
-| Global-vector baseline | No | Same staged policy | — | — | — |
-| Attention LSTM | Yes | Same staged policy | — | — | — |
+- Any claim that attention improved caption quality.
+- Any BLEU, METEOR, ROUGE-L, or CIDEr value.
+- Any claim of explainability beyond exposing and visualizing decoder attention weights.
+- Any statement implying production readiness or real-time service deployment.
 
-The dashes are deliberate. They should be replaced only by values reproduced from the repository's evaluation pipeline.
+The defensible achievement today is the controlled, leakage-resistant experimental pipeline and the completed training runs—not an unmeasured quality improvement.
