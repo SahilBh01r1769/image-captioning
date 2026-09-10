@@ -51,14 +51,18 @@ def test_colab_downloads_public_dataset_and_avoids_repeat_image_download():
     assert "DRIVE_CACHE.exists() and CAPTIONS_BACKUP.is_file()" in source
 
 
-def test_evaluation_notebook_is_valid_pinned_and_marks_smoke_outputs():
+def test_evaluation_notebook_has_cpu_preflight_and_separate_gpu_evaluation():
     notebook = json.loads(EVALUATION_NOTEBOOK.read_text(encoding="utf-8"))
     source = "\n".join(
         "".join(cell.get("source", [])) for cell in notebook["cells"]
     )
-    assert "ed94547cfa1d60baf91c1e76d7687952276541fc" in source
-    assert "--max_images','3'" in source
-    assert "partial_smoke_only" in source
+    assert "1b5b9a2aa009e8f60e131cf6d3ebe7114ee0d218" in source
+    assert "evaluation_preflight.py" in source
+    assert "--device', 'cpu'" in source
+    assert "timeout=600" in source
+    assert "preflight_passed" in source
+    assert "torch.cuda.is_available()" in source
+    assert "Copying feature cache" in source
     assert "--images_dir" in source
     assert "CaptionLab_evaluation_bundle" in source
     assert "num_beams" not in source
