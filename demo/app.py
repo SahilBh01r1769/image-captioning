@@ -13,8 +13,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import config
-from inference import attention_grid, generate_captions, load_model, preprocess_image
-from vocabulary import Vocabulary
+from inference import (
+    attention_grid,
+    generate_captions,
+    load_model,
+    load_vocabulary,
+    preprocess_image,
+)
 
 CUSTOM_MODEL_PATH = ROOT / "models" / "best_model.pth"
 CUSTOM_VOCAB_PATH = ROOT / "models" / "vocabulary.pkl"
@@ -83,7 +88,7 @@ def custom_model_available() -> bool:
 
 @st.cache_resource(show_spinner=False)
 def load_custom_model():
-    vocab = Vocabulary.load(str(CUSTOM_VOCAB_PATH))
+    vocab = load_vocabulary(str(CUSTOM_VOCAB_PATH))
     model, architecture = load_model(str(CUSTOM_MODEL_PATH), vocab, torch.device("cpu"))
     return vocab, model, architecture
 

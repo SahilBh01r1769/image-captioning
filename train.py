@@ -35,6 +35,7 @@ from run_artifacts import (
     stable_hash,
     trainable_model_state,
 )
+from visual_features import frozen_backbone_identity
 from vocabulary import TOKENIZER_VERSION, Vocabulary
 
 
@@ -228,6 +229,7 @@ def _checkpoint_payload(
         "identities": identities,
         "vocab_size": model.decoder.vocab_size,
         "frozen_backbone_excluded": True,
+        "frozen_backbone": frozen_backbone_identity(),
     }
 
 

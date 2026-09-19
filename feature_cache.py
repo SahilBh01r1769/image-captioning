@@ -12,7 +12,7 @@ from tqdm import tqdm
 import config
 from data_protocol import dataset_fingerprint
 from dataset import get_transform, parse_captions, resolve_dataset_split
-from visual_features import SpatialResNetBackbone
+from visual_features import SpatialResNetBackbone, frozen_backbone_identity
 from vocabulary import Vocabulary
 
 
@@ -43,12 +43,13 @@ class _ImageDataset(Dataset):
 def expected_cache_metadata(
     image_captions: dict[str, list[str]], image_keys: list[str]
 ) -> dict[str, Any]:
+    backbone = frozen_backbone_identity()
     return {
         "cache_version": FEATURE_CACHE_VERSION,
         "dataset_fingerprint": dataset_fingerprint(image_captions),
         "image_keys": list(image_keys),
-        "backbone": "torchvision.resnet50",
-        "weights": "IMAGENET1K_V1",
+        "backbone": backbone["name"],
+        "weights": backbone["weights"],
         "image_size": config.IMAGE_SIZE,
         "image_mean": list(config.IMAGE_MEAN),
         "image_std": list(config.IMAGE_STD),

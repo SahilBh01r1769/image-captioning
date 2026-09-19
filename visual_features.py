@@ -8,6 +8,15 @@ import torchvision.models as tv_models
 import config
 
 
+BACKBONE_NAME = "torchvision.resnet50"
+BACKBONE_WEIGHTS = "IMAGENET1K_V1"
+
+
+def frozen_backbone_identity() -> dict[str, str]:
+    """Return the exact frozen visual backbone used by training and inference."""
+    return {"name": BACKBONE_NAME, "weights": BACKBONE_WEIGHTS}
+
+
 def global_average_pool(spatial_features: torch.Tensor) -> torch.Tensor:
     """Pool ``(batch, locations, channels)`` features into one image vector."""
     if spatial_features.ndim != 3:

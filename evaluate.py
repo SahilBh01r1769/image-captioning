@@ -59,7 +59,12 @@ def load_verified_checkpoint(path: Path, vocab: Vocabulary, identities: dict[str
     checkpoint = torch.load(path, map_location=config.DEVICE, weights_only=False)
     if checkpoint.get("identities") != identities:
         raise RuntimeError(f"Checkpoint identity mismatch: {path}")
-    model, architecture = _build_model_for_checkpoint(checkpoint, vocab, config.DEVICE)
+    model, architecture = _build_model_for_checkpoint(
+        checkpoint,
+        vocab,
+        config.DEVICE,
+        load_image_encoder=False,
+    )
     return checkpoint, model, architecture
 
 

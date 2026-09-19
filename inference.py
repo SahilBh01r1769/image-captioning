@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import glob
 import math
 import os
+import pickle
 from typing import Optional
 
 import numpy as np
@@ -18,6 +19,7 @@ import config
 from attention_model import ExplainableCaptioningModel
 from model import ImageCaptioningModel
 from run_artifacts import load_trainable_model_state
+from visual_features import frozen_backbone_identity
 from vocabulary import Vocabulary
 
 
@@ -51,9 +53,69 @@ def load_image(path: str, device: torch.device) -> torch.Tensor:
     return preprocess_image(Image.open(path), device)
 
 
-def _build_model_for_checkpoint(checkpoint: dict, vocab: Vocabulary, device: torch.device):
-    architecture = checkpoint.get("architecture", "baseline")
-    experiment = checkpoint.get("experiment", {})
+def load_vocabulary(path: str = config.VOCAB_PATH) -> Vocabulary:
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"CaptionLab vocabulary not found: {path}. "
+            "Add the vocabulary.pkl saved with the checkpoint before running inference."
+        )
+    try:
+        vocab = Vocabulary.load(path)
+    except (OSError, EOFError, pickle.UnpicklingError, AttributeError, ImportError) as exc:
+        raise RuntimeError(
+            f"Could not read CaptionLab vocabulary {path}; it may be corrupt "
+            "or incompatible."
+        ) from exc
+    if not isinstance(vocab, Vocabulary):
+        raise RuntimeError(f"Vocabulary artifact is not a CaptionLab Vocabulary: {path}")
+    return vocab
+
+
+def _validate_checkpoint(checkpoint: object, vocab: Vocabulary) -> dict:
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError("Checkpoint is not a valid CaptionLab checkpoint dictionary")
+    if checkpoint.get("checkpoint_version") != 1:
+        raise RuntimeError(
+            f"Unsupported checkpoint version: {checkpoint.get('checkpoint_version')!r}"
+        )
+    if checkpoint.get("architecture") not in {"baseline", "attention"}:
+        raise RuntimeError(
+            f"Unsupported checkpoint architecture: {checkpoint.get('architecture')!r}"
+        )
+    if not isinstance(checkpoint.get("experiment"), dict):
+        raise RuntimeError("Checkpoint is missing its experiment configuration")
+    if not isinstance(checkpoint.get("model_state"), dict):
+        raise RuntimeError("Checkpoint is missing its model state")
+    if checkpoint.get("vocab_size") != len(vocab):
+        raise RuntimeError(
+            "Checkpoint vocabulary size does not match the loaded vocabulary "
+            f"({checkpoint.get('vocab_size')!r} != {len(vocab)})"
+        )
+    if checkpoint.get("frozen_backbone_excluded") is not True:
+        raise RuntimeError(
+            "Checkpoint does not declare the portable frozen-backbone format"
+        )
+
+    expected_backbone = frozen_backbone_identity()
+    declared_backbone = checkpoint.get("frozen_backbone")
+    if declared_backbone is not None and declared_backbone != expected_backbone:
+        raise RuntimeError(
+            "Checkpoint backbone does not match this inference build: "
+            f"expected {expected_backbone}, found {declared_backbone}"
+        )
+    return checkpoint
+
+
+def _build_model_for_checkpoint(
+    checkpoint: dict,
+    vocab: Vocabulary,
+    device: torch.device,
+    *,
+    load_image_encoder: bool = True,
+):
+    checkpoint = _validate_checkpoint(checkpoint, vocab)
+    architecture = checkpoint["architecture"]
+    experiment = checkpoint["experiment"]
     common = dict(
         vocab_size=len(vocab),
         embed_dim=experiment.get("embedding_dim", config.EMBED_DIM),
@@ -61,9 +123,10 @@ def _build_model_for_checkpoint(checkpoint: dict, vocab: Vocabulary, device: tor
         dropout=0.0,
         pad_idx=vocab[config.PAD_TOKEN],
         fine_tune_cnn=False,
-        # The checkpoint already contains encoder weights; avoid a redundant
-        # ImageNet download during inference and offline evaluation.
-        pretrained_encoder=False,
+        # Portable checkpoints omit the canonical frozen ResNet50. Raw-image
+        # inference must restore the exact ImageNet weights used to create the
+        # training feature cache. Cached-feature evaluation does not need it.
+        pretrained_encoder=load_image_encoder,
     )
     if architecture == "attention":
         model = ExplainableCaptioningModel(
@@ -73,10 +136,6 @@ def _build_model_for_checkpoint(checkpoint: dict, vocab: Vocabulary, device: tor
         )
     elif architecture == "baseline":
         model = ImageCaptioningModel(**common, num_layers=config.NUM_LAYERS)
-    else:
-        raise ValueError(f"Unsupported checkpoint architecture: {architecture}")
-    if checkpoint.get("vocab_size") not in (None, len(vocab)):
-        raise RuntimeError("Checkpoint vocabulary size does not match the loaded vocabulary")
     load_trainable_model_state(model, checkpoint["model_state"])
     model.to(device).eval()
     return model, architecture
@@ -84,9 +143,27 @@ def _build_model_for_checkpoint(checkpoint: dict, vocab: Vocabulary, device: tor
 
 def load_model(ckpt_path: str, vocab: Vocabulary, device: torch.device):
     if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Model checkpoint not found: {ckpt_path}")
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    return _build_model_for_checkpoint(checkpoint, vocab, device)
+        raise FileNotFoundError(
+            f"CaptionLab checkpoint not found: {ckpt_path}. "
+            "Add a compatible best.pt checkpoint before running inference."
+        )
+    try:
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+    except (
+        OSError,
+        EOFError,
+        pickle.UnpicklingError,
+        RuntimeError,
+        ValueError,
+        TypeError,
+    ) as exc:
+        raise RuntimeError(
+            f"Could not read CaptionLab checkpoint {ckpt_path}; it may be corrupt "
+            "or incompatible."
+        ) from exc
+    return _build_model_for_checkpoint(
+        checkpoint, vocab, device, load_image_encoder=True
+    )
 
 
 @torch.no_grad()
@@ -361,6 +438,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image", type=str)
     parser.add_argument("--image_dir", type=str)
     parser.add_argument("--model", type=str, default=config.BEST_MODEL_PATH)
+    parser.add_argument("--vocabulary", type=str, default=config.VOCAB_PATH)
     parser.add_argument("--beam_size", type=int, default=config.BEAM_SIZE)
     parser.add_argument("--temperature", type=float, default=config.DEFAULT_TEMPERATURE)
     return parser.parse_args()
@@ -386,7 +464,7 @@ def caption_path(path: str, model, architecture: str, vocab: Vocabulary, args: a
 
 def main() -> None:
     args = parse_args()
-    vocab = Vocabulary.load()
+    vocab = load_vocabulary(args.vocabulary)
     model, architecture = load_model(args.model, vocab, config.DEVICE)
     if args.image:
         caption_path(args.image, model, architecture, vocab, args)
