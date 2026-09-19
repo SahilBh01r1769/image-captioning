@@ -5,7 +5,7 @@ from pathlib import Path
 
 NOTEBOOK = Path(__file__).parents[1] / "notebooks" / "CaptionLab_Colab.ipynb"
 EVALUATION_NOTEBOOK = Path(__file__).parents[1] / "notebooks" / "CaptionLab_Evaluation.ipynb"
-PINNED_RUNNER_COMMIT = "95f78c8310027c32c80a430bc867e98ffa974328"
+PINNED_RUNNER_COMMIT = "7b2f2e2934c64022f7b5862ed701e39fffcbdb96"
 
 
 def _load_notebook():
@@ -38,7 +38,10 @@ def test_colab_notebook_covers_all_controlled_runs_and_restart_paths():
     assert "--resume" in source
     assert "--smoke" in source
     assert "--overwrite_smoke" in source
-    assert "CaptionLab_training_bundle.zip" in source
+    assert "CaptionLab_phase1_artifacts.zip" in source
+    assert "load_model(str(checkpoint_path)" in source
+    assert "phase1_artifact_manifest.json" in source
+    assert "sha256" in source
 
 
 def test_colab_downloads_public_dataset_and_avoids_repeat_image_download():
