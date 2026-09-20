@@ -60,7 +60,7 @@ def test_evaluation_notebook_has_cpu_preflight_and_separate_gpu_evaluation():
     source = "\n".join(
         "".join(cell.get("source", [])) for cell in notebook["cells"]
     )
-    assert "1b5b9a2aa009e8f60e131cf6d3ebe7114ee0d218" in source
+    assert "2f8089bf905d718d22495c979000d90ea1362616" in source
     assert "evaluation_preflight.py" in source
     assert "--device', 'cpu'" in source
     assert "timeout=600" in source
