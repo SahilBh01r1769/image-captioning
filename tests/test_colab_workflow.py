@@ -21,6 +21,7 @@ def test_colab_notebook_is_valid_python_and_pins_reviewed_runner():
     )
     assert PINNED_RUNNER_COMMIT in source
     assert "torch.cuda.is_available()" in source
+    assert "sys.path.insert(0, str(REPO))" in source
 
     for index, cell in enumerate(notebook["cells"]):
         if cell.get("cell_type") == "code":
